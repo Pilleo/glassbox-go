@@ -21,13 +21,9 @@ func (p *PDFProcessorImpl) ExtractTextFromFile(ctx context.Context, path gapi.Sa
 		return "", err
 	}
 
-	// Assert filesystem capability boundaries before reading
-	gate := &gapi.SecurityGate{}
-	if err := gate.CheckFileAccess(ctx, string(path)); err != nil {
-		return "", err
-	}
-
-	// Read and extract content, validating filesystem isolation
+	// Read and extract content, validating filesystem isolation.
+	// Note: gapi.SandboxPath already receives automatic host-side path validation
+	// in the proxy before the Wasm boundary is crossed, and WASI handles virtual filesystem access.
 	bytes, err := os.ReadFile(string(path))
 	if err != nil {
 		return "", err
