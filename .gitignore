@@ -17,6 +17,8 @@ go.work.sum
 # Project specific generated files
 /wasm/
 *_proxy.go
+**/guest/
+**/generate.go
 
 # IDEs and Editors
 .idea/
@@ -27,3 +29,11 @@ go.work.sum
 # OS specific
 .DS_Store
 Thumbs.db
+
+# AI session artifacts (implementation plans, task lists, walkthroughs)
+/artifacts/
+
+# Scratch / debugging scripts (should not be version-controlled)
+fix_guest.py
+patch_*.py
+test_msgpack.go

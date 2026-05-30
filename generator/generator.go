@@ -5,16 +5,20 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"text/template"
+
+	"golang.org/x/tools/imports"
 )
 
 func main() {
 	dirPath := flag.String("dir", ".", "Directory to scan for sandboxed Go interfaces")
+	autoBuild := flag.Bool("build", false, "Automatically compile the Wasm binary after generation")
 	flag.Parse()
 
 	absPath, err := filepath.Abs(*dirPath)
@@ -32,7 +36,10 @@ func main() {
 	}
 
 	for _, pkg := range pkgs {
-		processPackage(pkg, absPath)
+		if err := processPackage(pkg, absPath, *autoBuild); err != nil {
+			fmt.Printf("Error processing package %s: %v\n", pkg.Name, err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -43,32 +50,65 @@ type methodSpec struct {
 }
 
 type paramSpec struct {
-	Name string
-	Type string
+	Name       string
+	Type       string
+	IsVariadic bool
 }
 
 type interfaceSpec struct {
-	Name    string
-	Methods []methodSpec
+	Name     string
+	ImplName string
+	Methods  []methodSpec
 }
 
-func processPackage(pkg *ast.Package, absPath string) {
+type TemplateData struct {
+	PackageName    string
+	WasmModuleName string
+	Imports        []string
+	Interfaces     []interfaceSpec
+	Interface      interfaceSpec
+	ModulePath     string
+}
+
+func processPackage(pkg *ast.Package, absPath string, autoBuild bool) error {
 	var sandboxedInterfaces []interfaceSpec
 	packageName := pkg.Name
 
+	importSet := make(map[string]bool)
+	var fileImports []string
+	var processErr error
 	for _, file := range pkg.Files {
+		if processErr != nil {
+			break
+		}
+		for _, imp := range file.Imports {
+			val := imp.Path.Value
+			if imp.Name != nil {
+				val = imp.Name.Name + " " + val
+			}
+			if !importSet[val] {
+				importSet[val] = true
+				fileImports = append(fileImports, val)
+			}
+		}
 		ast.Inspect(file, func(n ast.Node) bool {
+			if processErr != nil {
+				return false
+			}
 			decl, ok := n.(*ast.GenDecl)
 			if !ok || decl.Tok != token.TYPE {
 				return true
 			}
 
 			isSandboxed := false
+			implName := ""
 			if decl.Doc != nil {
 				for _, comment := range decl.Doc.List {
 					if strings.Contains(comment.Text, "//gobox:sandbox") {
 						isSandboxed = true
-						break
+					}
+					if strings.HasPrefix(comment.Text, "//gobox:impl ") {
+						implName = strings.TrimSpace(strings.TrimPrefix(comment.Text, "//gobox:impl "))
 					}
 				}
 			}
@@ -100,7 +140,11 @@ func processPackage(pkg *ast.Package, absPath string) {
 					
 					fmt.Printf("[gobox-gen] Found Sandboxed Interface: %s\n", interfaceName)
 					
-					intfSpec := interfaceSpec{Name: interfaceName}
+					if implName == "" {
+						implName = interfaceName + "Impl"
+					}
+					
+					intfSpec := interfaceSpec{Name: interfaceName, ImplName: implName}
 					for _, field := range interfaceType.Methods.List {
 						funcType, ok := field.Type.(*ast.FuncType)
 						if !ok {
@@ -114,29 +158,56 @@ func processPackage(pkg *ast.Package, absPath string) {
 						// Parse parameters
 						if funcType.Params != nil {
 							for idx, p := range funcType.Params.List {
-								pType := typeExprToString(p.Type)
+								isVariadic := false
+								if _, ok := p.Type.(*ast.Ellipsis); ok {
+									isVariadic = true
+								}
+								pType, err := typeExprToString(p.Type)
+								if err != nil {
+									processErr = err
+									return false
+								}
 								if len(p.Names) > 0 {
 									for _, name := range p.Names {
-										params = append(params, paramSpec{Name: name.Name, Type: pType})
+										if pType == "string" {
+											lname := strings.ToLower(name.Name)
+											if strings.Contains(lname, "path") || strings.Contains(lname, "file") || strings.Contains(lname, "dir") {
+												fmt.Printf("[gobox-gen] WARNING: Parameter '%s' in %s.%s is a string but looks like a file path. Consider using gapi.SandboxPath to enforce host-side file access checks.\n", name.Name, interfaceName, methodName)
+											}
+										}
+										params = append(params, paramSpec{Name: name.Name, Type: pType, IsVariadic: isVariadic})
 									}
 								} else {
-									params = append(params, paramSpec{Name: fmt.Sprintf("arg%d", idx), Type: pType})
+									params = append(params, paramSpec{Name: fmt.Sprintf("arg%d", idx), Type: pType, IsVariadic: isVariadic})
 								}
 							}
 						}
 
 						// Parse results
 						if funcType.Results != nil {
-							for idx, r := range funcType.Results.List {
-								rType := typeExprToString(r.Type)
-								rName := ""
-								if len(r.Names) > 0 {
-									rName = r.Names[0].Name
-								} else {
-									rName = fmt.Sprintf("ret%d", idx)
+							resultIdx := 0
+							for _, r := range funcType.Results.List {
+								rType, err := typeExprToString(r.Type)
+								if err != nil {
+									processErr = err
+									return false
 								}
-								results = append(results, paramSpec{Name: rName, Type: rType})
+								if len(r.Names) > 0 {
+									for _, name := range r.Names {
+										results = append(results, paramSpec{Name: name.Name, Type: rType})
+										resultIdx++
+									}
+								} else {
+									results = append(results, paramSpec{Name: fmt.Sprintf("ret%d", resultIdx), Type: rType})
+									resultIdx++
+								}
 							}
+						}
+
+						if len(results) == 0 || results[len(results)-1].Type != "error" {
+							fmt.Printf("[gobox-gen] ERROR: Sandboxed interface %s.%s must return 'error' as its last return value.\n", interfaceName, methodName)
+							valid = false
+							break
 						}
 
 						intfSpec.Methods = append(intfSpec.Methods, methodSpec{
@@ -153,430 +224,553 @@ func processPackage(pkg *ast.Package, absPath string) {
 		})
 	}
 
+	if processErr != nil {
+		return processErr
+	}
+
 	if len(sandboxedInterfaces) > 0 {
 		for _, intf := range sandboxedInterfaces {
-			generateProxy(packageName, intf, absPath)
+			generateProxy(packageName, intf, absPath, fileImports)
 		}
-		generateGuest(packageName, sandboxedInterfaces, absPath)
+		generateGuest(packageName, sandboxedInterfaces, absPath, fileImports)
+		generateGoGenerateFile(packageName, packageName, absPath)
+
+		if autoBuild {
+			compileWasm(packageName, absPath)
+		}
 	}
+	return nil
 }
 
-func generateProxy(packageName string, intf interfaceSpec, absPath string) {
-	interfaceName := intf.Name
-	methods := intf.Methods
-
-	// Construct proxy source code
-	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprintf("// Code generated by gobox-gen. DO NOT EDIT.\npackage %s\n\n", packageName))
-	buf.WriteString("import (\n")
-	buf.WriteString("\t\"context\"\n")
-	buf.WriteString("\t\"fmt\"\n")
-	buf.WriteString("\t\"github.com/tetratelabs/wazero/api\"\n")
-	buf.WriteString("\tgapi \"github.com/glassbox-go/api\"\n")
-	buf.WriteString("\tgbridge \"github.com/glassbox-go/binarybridge\"\n")
-	buf.WriteString("\tgruntime \"github.com/glassbox-go/runtime\"\n")
-	buf.WriteString(")\n\n")
-
-	buf.WriteString(fmt.Sprintf("type %sWasmProxy struct {\n", interfaceName))
-	buf.WriteString("\tengine *gruntime.Engine\n")
-	buf.WriteString("\tlimits *gapi.SandboxLimits\n")
-	buf.WriteString("\tpool   chan api.Module\n")
-	buf.WriteString("}\n\n")
-
-	buf.WriteString(fmt.Sprintf("var _ %s = (*%sWasmProxy)(nil)\n\n", interfaceName, interfaceName))
-
-	buf.WriteString(fmt.Sprintf("func New%sWasmProxy(engine *gruntime.Engine, limits *gapi.SandboxLimits) (*%sWasmProxy, error) {\n", interfaceName, interfaceName))
-	buf.WriteString("\tif limits == nil {\n")
-	buf.WriteString("\t\tlimits = gapi.NewBuilder().Build()\n")
-	buf.WriteString("\t}\n")
-	buf.WriteString("\tif engine == nil {\n")
-	buf.WriteString("\t\treturn nil, fmt.Errorf(\"engine cannot be nil\")\n")
-	buf.WriteString("\t}\n")
-	buf.WriteString("\t// Eagerly verify module is compilable/instantiable and initialize the pool\n")
-	buf.WriteString("\tctx := context.Background()\n")
-	buf.WriteString(fmt.Sprintf("\tmod, err := engine.GetInstance(ctx, \"%s\", limits)\n", packageName)) // Use packageName here!
-	buf.WriteString("\tif err != nil {\n")
-	buf.WriteString(fmt.Sprintf("\t\treturn nil, gapi.NewSandboxSecurityError(fmt.Sprintf(\"Failed to initialize secure Wasm sandbox for %s: %%v\", err))\n", packageName))
-	buf.WriteString("\t}\n")
-	
-	buf.WriteString("\tif mod.ExportedFunction(\"malloc\") == nil {\n")
-	buf.WriteString("\t\tmod.Close(ctx)\n")
-	buf.WriteString("\t\treturn nil, gapi.NewSandboxSecurityError(\"wasm module does not export malloc\")\n")
-	buf.WriteString("\t}\n")
-	buf.WriteString("\tif mod.ExportedFunction(\"free\") == nil {\n")
-	buf.WriteString("\t\tmod.Close(ctx)\n")
-	buf.WriteString("\t\treturn nil, gapi.NewSandboxSecurityError(\"wasm module does not export free\")\n")
-	buf.WriteString("\t}\n")
-	for _, method := range methods {
-		buf.WriteString(fmt.Sprintf("\tif mod.ExportedFunction(\"%s\") == nil {\n", method.Name))
-		buf.WriteString("\t\tmod.Close(ctx)\n")
-		buf.WriteString(fmt.Sprintf("\t\treturn nil, gapi.NewSandboxSecurityError(\"wasm module does not export %s\")\n", method.Name))
-		buf.WriteString("\t}\n")
-	}
-
-	buf.WriteString("\tmod.Close(ctx)\n\n")
-
-	buf.WriteString(fmt.Sprintf("\tp := &%sWasmProxy{\n", interfaceName))
-	buf.WriteString("\t\tengine: engine,\n")
-	buf.WriteString("\t\tlimits: limits,\n")
-	buf.WriteString("\t\tpool:   make(chan api.Module, 10), // Buffered pool for reuse\n")
-	buf.WriteString("\t}\n")
-	buf.WriteString("\treturn p, nil\n")
-	buf.WriteString("}\n\n")
-
-	buf.WriteString(fmt.Sprintf("func (p *%sWasmProxy) Close() error {\n", interfaceName))
-	buf.WriteString("\tctx := context.Background()\n")
-	buf.WriteString("\tfor {\n")
-	buf.WriteString("\t\tselect {\n")
-	buf.WriteString("\t\tcase mod := <-p.pool:\n")
-	buf.WriteString("\t\t\tmod.Close(ctx)\n")
-	buf.WriteString("\t\tdefault:\n")
-	buf.WriteString("\t\t\treturn nil\n")
-	buf.WriteString("\t\t}\n")
-	buf.WriteString("\t}\n")
-	buf.WriteString("}\n\n")
-
-	buf.WriteString(fmt.Sprintf("func (p *%sWasmProxy) acquireModule(ctx context.Context) (api.Module, error) {\n", interfaceName))
-	buf.WriteString("\tselect {\n")
-	buf.WriteString("\tcase mod := <-p.pool:\n")
-	buf.WriteString("\t\treturn mod, nil\n")
-	buf.WriteString("\tdefault:\n")
-	buf.WriteString(fmt.Sprintf("\t\treturn p.engine.GetInstance(ctx, \"%s\", p.limits)\n", packageName))
-	buf.WriteString("\t}\n")
-	buf.WriteString("}\n\n")
-
-	buf.WriteString(fmt.Sprintf("func (p *%sWasmProxy) releaseModule(mod api.Module) {\n", interfaceName))
-	buf.WriteString("\tselect {\n")
-	buf.WriteString("\tcase p.pool <- mod:\n")
-	buf.WriteString("\tdefault:\n")
-	buf.WriteString("\t\tmod.Close(context.Background())\n")
-	buf.WriteString("\t}\n")
-	buf.WriteString("}\n\n")
-
-	// Write method implementations
-	for _, method := range methods {
-		paramList := []string{}
-		for _, p := range method.Params {
-			paramList = append(paramList, fmt.Sprintf("%s %s", p.Name, p.Type))
+var funcMap = template.FuncMap{
+	"lower": strings.ToLower,
+	"joinParams": func(params []paramSpec) string {
+		var s []string
+		for _, p := range params {
+			s = append(s, fmt.Sprintf("%s %s", p.Name, p.Type))
 		}
-
-		resultTypes := []string{}
-		for _, r := range method.Results {
-			resultTypes = append(resultTypes, r.Type)
-		}
-
-		retString := strings.Join(resultTypes, ", ")
-		if len(resultTypes) > 1 {
-			retString = "(" + retString + ")"
-		}
-
-		buf.WriteString(fmt.Sprintf("func (p *%sWasmProxy) %s(%s) %s {\n", interfaceName, method.Name, strings.Join(paramList, ", "), retString))
-		buf.WriteString("\t// 1. Establish Context limits boundary\n")
-		hasCtxParam := false
-		for _, p := range method.Params {
-			if p.Name == "ctx" || p.Type == "context.Context" {
-				hasCtxParam = true
-				break
+		return strings.Join(s, ", ")
+	},
+	"joinNamedResults": func(results []paramSpec) string {
+		var s []string
+		for i, r := range results {
+			if i == len(results)-1 {
+				s = append(s, "outErr error")
+			} else {
+				s = append(s, fmt.Sprintf("out%d %s", i, r.Type))
 			}
 		}
-		if !hasCtxParam {
-			buf.WriteString("\tctx := context.Background()\n")
+		if len(s) == 0 {
+			return ""
 		}
-		buf.WriteString("\tif p.limits.Timeout() > 0 {\n")
-		buf.WriteString("\t\tvar cancel context.CancelFunc\n")
-		buf.WriteString("\t\tctx, cancel = context.WithTimeout(ctx, p.limits.Timeout())\n")
-		buf.WriteString("\t\tdefer cancel()\n")
-		buf.WriteString("\t}\n")
-		buf.WriteString("\tif len(p.limits.AllowedDirectories()) > 0 || len(p.limits.AllowedNetworkAddresses()) > 0 {\n")
-		buf.WriteString("\t\tctx = gapi.WithActiveLimits(ctx, p.limits)\n")
-		buf.WriteString("\t}\n\n")
-
-		for _, p := range method.Params {
-			if p.Name == "path" || p.Name == "filePath" {
-				buf.WriteString("\tgate := &gapi.SecurityGate{}\n")
-				buf.WriteString(fmt.Sprintf("\tif err := gate.CheckFileAccess(ctx, %s); err != nil {\n", p.Name))
-				buf.WriteString(fmt.Sprintf("\t\treturn %s\n", generateZeroReturns(method.Results, "err")))
-				buf.WriteString("\t}\n\n")
+		return "(" + strings.Join(s, ", ") + ")"
+	},
+	"hasContextParam": func(params []paramSpec) bool {
+		for _, p := range params {
+			if isContextType(p.Type) {
+				return true
 			}
 		}
-
-		buf.WriteString("\tvar payload []byte\n")
-		buf.WriteString("\tvar err error\n")
-		buf.WriteString("\tpayload, err = gbridge.SerializeAsBytes([]interface{}{\n")
-		for _, p := range method.Params {
-			if p.Type == "context.Context" || p.Type == "Context" {
-				continue
+		return false
+	},
+	"contextVarName": func(params []paramSpec) string {
+		for _, p := range params {
+			if isContextType(p.Type) {
+				return p.Name
 			}
-			buf.WriteString(fmt.Sprintf("\t\t\t%s,\n", p.Name))
 		}
-		buf.WriteString("\t\t})\n")
-		buf.WriteString("\t\tif err != nil {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"serialization failed: %w\", err)")))
-		buf.WriteString("\t\t}\n\n")
-
-		buf.WriteString("\t\t// Get a module from the pool\n")
-		buf.WriteString("\t\tmod, err := p.acquireModule(ctx)\n")
-		buf.WriteString("\t\tif err != nil {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"failed to get sandbox instance: %w\", err)")))
-		buf.WriteString("\t\t}\n")
-		buf.WriteString("\t\tdefer p.releaseModule(mod)\n\n")
-
-		buf.WriteString("\t\tmalloc := mod.ExportedFunction(\"malloc\")\n")
-		buf.WriteString("\t\tif malloc == nil {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"wasm module does not export malloc\")")))
-		buf.WriteString("\t\t}\n")
-		buf.WriteString("\t\tfree := mod.ExportedFunction(\"free\")\n")
-		buf.WriteString("\t\tif free == nil {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"wasm module does not export free\")")))
-		buf.WriteString("\t\t}\n")
-		buf.WriteString(fmt.Sprintf("\t\twasmFunc := mod.ExportedFunction(\"%s\")\n", method.Name))
-		buf.WriteString("\t\tif wasmFunc == nil {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, fmt.Sprintf("fmt.Errorf(\"wasm module does not export %%s\", %q)", method.Name))))
-		buf.WriteString("\t\t}\n\n")
-
-		buf.WriteString("\t\tresults, err := malloc.Call(ctx, uint64(len(payload)))\n")
-		buf.WriteString("\t\tif err != nil {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"failed to allocate guest memory: %w\", err)")))
-		buf.WriteString("\t\t}\n")
-		buf.WriteString("\t\tguestPtr := uint32(results[0])\n")
-		buf.WriteString("\t\tif !mod.Memory().Write(guestPtr, payload) {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"failed to write payload to guest memory\")")))
-		buf.WriteString("\t\t}\n\n")
-
-		buf.WriteString("\t\t// Execute guest function and release temporary scratch buffer\n")
-		buf.WriteString("\t\tcallRes, err := wasmFunc.Call(ctx, uint64(guestPtr), uint64(len(payload)))\n")
-		buf.WriteString("\t\t_, _ = free.Call(ctx, uint64(guestPtr))\n")
-		buf.WriteString("\t\tif err != nil {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"sandbox execution failed: %w\", err)")))
-		buf.WriteString("\t\t}\n\n")
-
-		buf.WriteString("\t\tretPtr := uint32(callRes[0] >> 32)\n")
-		buf.WriteString("\t\tretLen := uint32(callRes[0] & 0xFFFFFFFF)\n")
-		buf.WriteString("\t\tretBytes, ok := mod.Memory().Read(retPtr, retLen)\n")
-		buf.WriteString("\t\tif !ok {\n")
-		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"failed to read return payload from guest memory\")")))
-		buf.WriteString("\t\t}\n\n")
-
-		if len(method.Results) > 0 {
-			buf.WriteString("\t\t// Use a local struct for direct deserialization to fix struct type assertion bug\n")
-			buf.WriteString("\t\tvar outResults struct {\n")
-			for idx, r := range method.Results {
-				buf.WriteString(fmt.Sprintf("\t\t\tRet%d %s\n", idx, r.Type))
+		return "ctx"
+	},
+	"isSandboxPath": func(t string) bool {
+		return t == "gapi.SandboxPath" || t == "SandboxPath"
+	},
+	"isContextType": isContextType,
+	"filterContext": func(params []paramSpec) []paramSpec {
+		var out []paramSpec
+		for _, p := range params {
+			if !isContextType(p.Type) {
+				out = append(out, p)
 			}
-			buf.WriteString("\t\t}\n")
-			buf.WriteString("\t\terr = gbridge.DeserializeFromBytes(retBytes, &outResults)\n")
-			buf.WriteString("\t\tif err != nil {\n")
-			buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"deserialization failed: %w\", err)")))
-			buf.WriteString("\t\t}\n\n")
-			buf.WriteString("\t\t_, _ = free.Call(ctx, uint64(retPtr))\n\n")
-			var rets []string
-			for idx, r := range method.Results {
-				if r.Type == "error" {
-					rets = append(rets, fmt.Sprintf("gbridge.UnmarshalError(outResults.Ret%d)", idx))
-				} else {
-					rets = append(rets, fmt.Sprintf("outResults.Ret%d", idx))
+		}
+		return out
+	},
+	"guestArgType": func(p paramSpec) string {
+		if p.IsVariadic {
+			return "[]" + strings.TrimPrefix(p.Type, "...")
+		}
+		return p.Type
+	},
+	"hasErrorResult": func(results []paramSpec) bool {
+		for _, r := range results {
+			if r.Type == "error" {
+				return true
+			}
+		}
+		return false
+	},
+	"guestCallAssignment": func(results []paramSpec) string {
+		var s []string
+		for i, r := range results {
+			if r.Type == "error" {
+				s = append(s, "err")
+			} else {
+				s = append(s, fmt.Sprintf("ret%d", i))
+			}
+		}
+		if len(s) == 0 {
+			return ""
+		}
+		return strings.Join(s, ", ") + " ="
+	},
+	"guestCallArgs": func(params []paramSpec) string {
+		var s []string
+		argIdx := 0
+		for _, p := range params {
+			if isContextType(p.Type) {
+				s = append(s, "context.Background()")
+			} else {
+				argVal := fmt.Sprintf("args.Arg%d", argIdx)
+				if p.Type == "gapi.SandboxPath" || p.Type == "SandboxPath" {
+					argVal = fmt.Sprintf("%s(%s)", p.Type, argVal)
 				}
+				if p.IsVariadic {
+					argVal += "..."
+				}
+				s = append(s, argVal)
+				argIdx++
 			}
-			buf.WriteString(fmt.Sprintf("\t\treturn %s\n", strings.Join(rets, ", ")))
-		} else {
-			buf.WriteString("\t\t_, _ = free.Call(ctx, uint64(retPtr))\n")
 		}
-		buf.WriteString("}\n\n")
-	}
-
-	outputPath := filepath.Join(absPath, fmt.Sprintf("%s_proxy.go", strings.ToLower(interfaceName)))
-	
-	// Format the source code before writing
-	formatted, err := format.Source(buf.Bytes())
-	if err != nil {
-		fmt.Printf("Failed to format generated proxy file: %v\n", err)
-		// Fallback to unformatted if formatting fails
-		formatted = buf.Bytes()
-	}
-
-	err = os.WriteFile(outputPath, formatted, 0644)
-	if err != nil {
-		fmt.Printf("Failed to write generated proxy file: %v\n", err)
-	} else {
-		fmt.Printf("[gobox-gen] Successfully generated proxy: %s\n", outputPath)
-	}
+		return strings.Join(s, ", ")
+	},
 }
 
-func generateGuest(packageName string, interfaces []interfaceSpec, absPath string) {
+func isContextType(t string) bool {
+	return t == "context.Context" || t == "Context"
+}
+
+const goGenerateTemplateText = `// Code generated by gobox-gen. DO NOT EDIT.
+package {{.PackageName}}
+
+// Run 'go generate' in this directory to recompile the sandboxed Wasm binary.
+//` + `go:generate env GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o ../wasm/{{.WasmModuleName}}.wasm ./guest
+`
+
+func generateGoGenerateFile(packageName, wasmModuleName string, absPath string) {
+	tmpl := template.Must(template.New("generate").Parse(goGenerateTemplateText))
+	var buf bytes.Buffer
+	data := TemplateData{
+		PackageName:    packageName,
+		WasmModuleName: wasmModuleName,
+	}
+	if err := tmpl.Execute(&buf, data); err != nil {
+		fmt.Printf("Failed to execute go:generate template: %v\n", err)
+		return
+	}
+	outputPath := filepath.Join(absPath, "generate.go")
+	writeFormatted(buf.Bytes(), outputPath)
+}
+
+const proxyTemplateText = `// Code generated by gobox-gen. DO NOT EDIT.
+package {{.PackageName}}
+
+import (
+	"context"
+	"fmt"
+	"github.com/tetratelabs/wazero/api"
+	gapi "github.com/glassbox-go/api"
+	gbridge "github.com/glassbox-go/binarybridge"
+	gruntime "github.com/glassbox-go/runtime"
+{{range .Imports}}	{{.}}
+{{end}})
+
+type {{.Interface.Name}}WasmProxy struct {
+	engine *gruntime.Engine
+	limits *gapi.SandboxLimits
+}
+
+var _ {{.Interface.Name}} = (*{{.Interface.Name}}WasmProxy)(nil)
+
+func New{{.Interface.Name}}WasmProxy(engine *gruntime.Engine, limits *gapi.SandboxLimits) (*{{.Interface.Name}}WasmProxy, error) {
+	if limits == nil {
+		limits = gapi.NewBuilder().Build()
+	}
+	if engine == nil {
+		return nil, fmt.Errorf("engine cannot be nil")
+	}
+	// Eagerly verify module is compilable/instantiable and initialize the pool
+	ctx := context.Background()
+	mod, err := engine.GetInstance(ctx, "{{.PackageName}}", limits)
+	if err != nil {
+		return nil, gapi.NewSandboxSecurityError(fmt.Sprintf("Failed to initialize secure Wasm sandbox for {{.PackageName}}: %v", err))
+	}
+	if mod.ExportedFunction("malloc") == nil {
+		mod.Close(ctx)
+		return nil, gapi.NewSandboxSecurityError("wasm module does not export malloc")
+	}
+	if mod.ExportedFunction("free") == nil {
+		mod.Close(ctx)
+		return nil, gapi.NewSandboxSecurityError("wasm module does not export free")
+	}
+{{range .Interface.Methods}}	if mod.ExportedFunction("{{.Name}}") == nil {
+		mod.Close(ctx)
+		return nil, gapi.NewSandboxSecurityError("wasm module does not export {{.Name}}")
+	}
+{{end}}	mod.Close(ctx)
+
+	p := &{{.Interface.Name}}WasmProxy{
+		engine: engine,
+		limits: limits,
+	}
+	return p, nil
+}
+
+func (p *{{.Interface.Name}}WasmProxy) Close() error {
+	return nil
+}
+
+func (p *{{.Interface.Name}}WasmProxy) acquireModule(ctx context.Context) (api.Module, error) {
+	// SECURITY TRADEOFF: Glassbox-Go instantiates a fresh guest module on every single invocation.
+	// This guarantees that all memory, global state, and allocated buffers are completely wiped cleanly
+	// between calls, completely preventing data leakage between sandboxed invocations. While this adds
+	// some instantiation overhead compared to pooling persistent stateful instances, the security benefit
+	// of perfect isolation makes it the safest choice for sandboxing untrusted code.
+	return p.engine.GetInstance(ctx, "{{.PackageName}}", p.limits)
+}
+
+func (p *{{.Interface.Name}}WasmProxy) releaseModule(ctx context.Context, mod api.Module, success bool) {
+	p.engine.ReleaseInstance(ctx, mod, p.limits, success)
+}
+
+{{range .Interface.Methods}}
+func (p *{{$.Interface.Name}}WasmProxy) {{.Name}}({{joinParams .Params}}) {{joinNamedResults .Results}} {
+	// 1. Establish Context limits boundary
+{{if not (hasContextParam .Params)}}	ctx := context.Background()
+{{else}}{{if ne (contextVarName .Params) "ctx"}}	ctx := {{contextVarName .Params}}
+{{end}}{{end}}	if p.limits.Timeout() > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.limits.Timeout())
+		defer cancel()
+	}
+	// Early exit if context already canceled
+	if err := ctx.Err(); err != nil {
+		outErr = err
+		return
+	}
+	ctx = gapi.WithActiveLimits(ctx, p.limits)
+
+{{range .Params}}{{if isSandboxPath .Type}}	gate := &gapi.SecurityGate{}
+	if err := gate.CheckFileAccess(ctx, string({{.Name}})); err != nil {
+		outErr = err
+		return
+	}
+
+{{end}}{{end}}	var payload []byte
+	var err error
+	payload, err = gbridge.SerializeAsBytes([]interface{}{
+{{range .Params}}{{if not (isContextType .Type)}}		{{.Name}},
+{{end}}{{end}}	})
+	if err != nil {
+		outErr = fmt.Errorf("serialization failed: %w", err)
+		return
+	}
+
+	// Acquire a clean guest module instance for this isolated call
+	mod, err := p.acquireModule(ctx)
+	if err != nil {
+		outErr = fmt.Errorf("failed to get sandbox instance: %w", err)
+		return
+	}
+	success := false
+	defer func() { p.releaseModule(ctx, mod, success) }()
+
+	malloc := mod.ExportedFunction("malloc")
+	if malloc == nil {
+		outErr = fmt.Errorf("wasm module does not export malloc")
+		return
+	}
+	free := mod.ExportedFunction("free")
+	if free == nil {
+		outErr = fmt.Errorf("wasm module does not export free")
+		return
+	}
+	wasmFunc := mod.ExportedFunction("{{.Name}}")
+	if wasmFunc == nil {
+		outErr = fmt.Errorf("wasm module does not export %s", "{{.Name}}")
+		return
+	}
+
+	results, err := malloc.Call(ctx, uint64(len(payload)))
+	if err != nil {
+		outErr = fmt.Errorf("failed to allocate guest memory: %w", err)
+		return
+	}
+	guestPtr := uint32(results[0])
+	defer func() { _, _ = free.Call(context.Background(), uint64(guestPtr)) }()
+
+	if !mod.Memory().Write(guestPtr, payload) {
+		outErr = fmt.Errorf("failed to write payload to guest memory")
+		return
+	}
+
+	// Execute guest function and release temporary scratch buffer
+	callRes, err := wasmFunc.Call(ctx, uint64(guestPtr), uint64(len(payload)))
+	if err != nil {
+		outErr = fmt.Errorf("sandbox execution failed: %w", err)
+		return
+	}
+
+	retPtr := uint32(callRes[0] >> 32)
+	defer func() { _, _ = free.Call(context.Background(), uint64(retPtr)) }()
+
+	retLen := uint32(callRes[0] & 0xFFFFFFFF)
+	retBytes, ok := mod.Memory().Read(retPtr, retLen)
+	if !ok {
+		outErr = fmt.Errorf("failed to read return payload from guest memory")
+		return
+	}
+
+{{if len .Results}}	// Use a local struct for direct deserialization to fix struct type assertion bug
+	var outResults struct {
+		_msgpack struct{} ` + "`msgpack:\",asArray\"`" + `
+{{range $i, $r := .Results}}		Ret{{$i}} {{$r.Type}}
+{{end}}	}
+	err = gbridge.DeserializeFromBytes(retBytes, &outResults)
+	if err != nil {
+		outErr = fmt.Errorf("deserialization failed: %w", err)
+		return
+	}
+
+{{range $i, $r := .Results}}{{if eq $r.Type "error"}}	outErr = gbridge.UnmarshalError(outResults.Ret{{$i}})
+{{else}}	out{{$i}} = outResults.Ret{{$i}}
+{{end}}{{end}}	
+	success = true
+	return
+{{else}}{{end}}}
+{{end}}`
+
+func generateProxy(packageName string, intf interfaceSpec, absPath string, fileImports []string) {
+	tmpl := template.Must(template.New("proxy").Funcs(funcMap).Parse(proxyTemplateText))
+	var buf bytes.Buffer
+	data := TemplateData{
+		PackageName: packageName,
+		Interface:   intf,
+		Imports:     fileImports,
+	}
+	if err := tmpl.Execute(&buf, data); err != nil {
+		fmt.Printf("Failed to execute proxy template: %v\n", err)
+		return
+	}
+
+	outputPath := filepath.Join(absPath, fmt.Sprintf("%s_proxy.go", strings.ToLower(intf.Name)))
+	writeFormatted(buf.Bytes(), outputPath)
+}
+
+const guestTemplateText = `// Code generated by gobox-gen. DO NOT EDIT.
+//go:build wasip1
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"unsafe"
+	"github.com/glassbox-go/binarybridge"
+{{range .Imports}}	{{.}}
+{{end}}	"{{.ModulePath}}"
+)
+
+func main() {}
+
+{{range .Interfaces}}
+{{$intfName := .Name}}
+// --- {{.Name}} ---
+var {{lower .Name}}Impl = &{{$.PackageName}}.{{.ImplName}}{}
+
+{{range .Methods}}
+//go:wasmexport {{.Name}}
+func {{.Name}}(ptr *byte, size uint32) uint64 {
+	payload := unsafe.Slice(ptr, size)
+	var args struct {
+		_msgpack struct{} ` + "`msgpack:\",asArray\"`" + `
+{{range $i, $p := (filterContext .Params)}}		Arg{{$i}} {{guestArgType $p}}
+{{end}}	}
+	errDeserialize := binarybridge.DeserializeFromBytes(payload, &args)
+
+{{range $i, $r := .Results}}{{if eq $r.Type "error"}}	var err error
+{{else}}	var ret{{$i}} {{$r.Type}}
+{{end}}{{end}}	var errOut string
+
+	if errDeserialize != nil {
+		errOut = fmt.Sprintf("deserialization failed in guest: %v", errDeserialize)
+	} else {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errOut = fmt.Sprintf("panic in wasm guest: %v", r)
+				}
+			}()
+			{{guestCallAssignment .Results}} {{lower $intfName}}Impl.{{.Name}}({{guestCallArgs .Params}})
+		}()
+	}
+
+{{if hasErrorResult .Results}}	if errOut == "" && err != nil {
+		errOut = err.Error()
+	}
+{{end}}
+	retBytes, _ := binarybridge.SerializeAsBytes([]interface{}{
+{{range $i, $r := .Results}}{{if eq $r.Type "error"}}		errOut,
+{{else}}		ret{{$i}},
+{{end}}{{end}}	})
+
+	return binarybridge.KeepAliveAndPack(retBytes)
+}
+{{end}}{{end}}`
+
+func generateGuest(packageName string, interfaces []interfaceSpec, absPath string, fileImports []string) {
 	guestDir := filepath.Join(absPath, "guest")
 	if err := os.MkdirAll(guestDir, 0755); err != nil {
 		fmt.Printf("Failed to create guest directory: %v\n", err)
 		return
 	}
 
+	tmpl := template.Must(template.New("guest").Funcs(funcMap).Parse(guestTemplateText))
 	var buf bytes.Buffer
-	buf.WriteString("// Code generated by gobox-gen. DO NOT EDIT.\n")
-	buf.WriteString("package main\n\n")
-	buf.WriteString("import (\n")
-	buf.WriteString("\t\"context\"\n")
-	buf.WriteString("\t\"unsafe\"\n")
-	buf.WriteString("\t\"github.com/glassbox-go/binarybridge\"\n")
-	
-	pkgPath := "github.com/glassbox-go/" + filepath.Base(absPath)
-	buf.WriteString(fmt.Sprintf("\t\"%s\"\n", pkgPath))
-	buf.WriteString(")\n\n")
-
-	buf.WriteString("func main() {}\n\n")
-	buf.WriteString("var allocations = make(map[uintptr][]byte)\n\n")
-	
-	buf.WriteString("//go:wasmexport malloc\n")
-	buf.WriteString("func malloc(size uint32) *byte {\n")
-	buf.WriteString("\tbuf := make([]byte, size)\n")
-	buf.WriteString("\tptr := &buf[0]\n")
-	buf.WriteString("\tallocations[uintptr(unsafe.Pointer(ptr))] = buf\n")
-	buf.WriteString("\treturn ptr\n")
-	buf.WriteString("}\n\n")
-
-	buf.WriteString("//go:wasmexport free\n")
-	buf.WriteString("func free(ptr *byte) {\n")
-	buf.WriteString("\tdelete(allocations, uintptr(unsafe.Pointer(ptr)))\n")
-	buf.WriteString("}\n\n")
-
-	buf.WriteString("func keepAliveAndPack(buf []byte) uint64 {\n")
-	buf.WriteString("\tptr := &buf[0]\n")
-	buf.WriteString("\tallocations[uintptr(unsafe.Pointer(ptr))] = buf\n")
-	buf.WriteString("\treturn (uint64(uint32(uintptr(unsafe.Pointer(ptr)))) << 32) | uint64(len(buf))\n")
-	buf.WriteString("}\n\n")
-
-	for _, intf := range interfaces {
-		buf.WriteString(fmt.Sprintf("// --- %s ---\n", intf.Name))
-		buf.WriteString(fmt.Sprintf("var %sImpl = &%s.%sImpl{}\n\n", strings.ToLower(intf.Name), packageName, intf.Name))
-
-		for _, method := range intf.Methods {
-			buf.WriteString(fmt.Sprintf("//go:wasmexport %s\n", method.Name))
-			buf.WriteString(fmt.Sprintf("func %s(ptr *byte, size uint32) uint64 {\n", method.Name))
-			buf.WriteString("\tpayload := unsafe.Slice(ptr, size)\n")
-			buf.WriteString("\tvar args []interface{}\n")
-			buf.WriteString("\t_ = binarybridge.DeserializeFromBytes(payload, &args)\n\n")
-
-			var callArgs []string
-			argIdx := 0
-			for _, p := range method.Params {
-				if p.Type == "context.Context" || p.Type == "Context" {
-					callArgs = append(callArgs, "context.Background()")
-				} else {
-					buf.WriteString(fmt.Sprintf("\tvar arg%d %s\n", argIdx, p.Type))
-					buf.WriteString(fmt.Sprintf("\tif len(args) > %d {\n", argIdx))
-					// Basic type assertion
-					buf.WriteString(fmt.Sprintf("\t\tif val, ok := args[%d].(%s); ok {\n", argIdx, p.Type))
-					buf.WriteString(fmt.Sprintf("\t\t\targ%d = val\n", argIdx))
-					buf.WriteString("\t\t}\n")
-					buf.WriteString("\t}\n")
-					callArgs = append(callArgs, fmt.Sprintf("arg%d", argIdx))
-					argIdx++
-				}
-			}
-
-			// Do the call
-			var retVars []string
-			hasError := false
-			for i, r := range method.Results {
-				if r.Type == "error" {
-					hasError = true
-					retVars = append(retVars, "err")
-				} else {
-					retVars = append(retVars, fmt.Sprintf("ret%d", i))
-				}
-			}
-
-			callStr := ""
-			if len(retVars) > 0 {
-				callStr = strings.Join(retVars, ", ") + " := "
-			}
-			callStr += fmt.Sprintf("%sImpl.%s(%s)\n", strings.ToLower(intf.Name), method.Name, strings.Join(callArgs, ", "))
-			buf.WriteString("\t" + callStr)
-
-			var serializeArgs []string
-			if hasError {
-				buf.WriteString("\tvar errOut string\n")
-				buf.WriteString("\tif err != nil {\n")
-				buf.WriteString("\t\terrOut = err.Error()\n")
-				buf.WriteString("\t}\n")
-			}
-
-			for i, r := range method.Results {
-				if r.Type == "error" {
-					serializeArgs = append(serializeArgs, "errOut")
-				} else {
-					serializeArgs = append(serializeArgs, fmt.Sprintf("ret%d", i))
-				}
-			}
-
-			buf.WriteString("\tretBytes, _ := binarybridge.SerializeAsBytes([]interface{}{\n")
-			for _, sa := range serializeArgs {
-				buf.WriteString(fmt.Sprintf("\t\t%s,\n", sa))
-			}
-			buf.WriteString("\t})\n\n")
-
-			buf.WriteString("\treturn keepAliveAndPack(retBytes)\n")
-			buf.WriteString("}\n\n")
-		}
+	data := TemplateData{
+		PackageName: packageName,
+		Interfaces:  interfaces,
+		Imports:     fileImports,
+		ModulePath:  getModulePath(absPath),
+	}
+	if err := tmpl.Execute(&buf, data); err != nil {
+		fmt.Printf("Failed to execute guest template: %v\n", err)
+		return
 	}
 
 	outputPath := filepath.Join(guestDir, "main.go")
+	writeFormatted(buf.Bytes(), outputPath)
+}
+
+func compileWasm(packageName string, absPath string) {
+	fmt.Printf("[gobox-gen] Automatically compiling Wasm binary for package: %s\n", packageName)
 	
-	formatted, err := format.Source(buf.Bytes())
-	if err != nil {
-		fmt.Printf("Failed to format generated guest file: %v\n", err)
-		formatted = buf.Bytes()
+	root := absPath
+	for {
+		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			break // Reached filesystem root
+		}
+		root = parent
 	}
-
-	err = os.WriteFile(outputPath, formatted, 0644)
+	
+	wasmDir := filepath.Join(root, "wasm")
+	if err := os.MkdirAll(wasmDir, 0755); err != nil {
+		fmt.Printf("[gobox-gen] ERROR: Failed to create wasm directory: %v\n", err)
+		return
+	}
+	
+	outputPath := filepath.Join(wasmDir, packageName+".wasm")
+	guestPath := filepath.Join(absPath, "guest")
+	
+	cmd := exec.Command("go", "build", "-buildmode=c-shared", "-o", outputPath, ".")
+	cmd.Dir = guestPath
+	cmd.Env = append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm")
+	
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("Failed to write generated guest file: %v\n", err)
+		fmt.Printf("[gobox-gen] ERROR: Wasm compilation failed:\n%s\n", string(output))
 	} else {
-		fmt.Printf("[gobox-gen] Successfully generated guest shim: %s\n", outputPath)
+		fmt.Printf("[gobox-gen] Successfully compiled: %s\n", outputPath)
 	}
 }
 
-func generateZeroReturns(results []paramSpec, lastErr string) string {
-	var rets []string
-	for i := 0; i < len(results)-1; i++ {
-		rets = append(rets, getZeroValue(results[i].Type))
+func getModulePath(dir string) string {
+	originalDir := dir
+	for {
+		modPath := filepath.Join(dir, "go.mod")
+		if data, err := os.ReadFile(modPath); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, "module ") {
+					modName := strings.TrimSpace(strings.TrimPrefix(line, "module "))
+					rel, _ := filepath.Rel(filepath.Dir(modPath), originalDir)
+					if rel == "." {
+						return modName
+					}
+					return filepath.Join(modName, filepath.ToSlash(rel))
+				}
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
 	}
-	rets = append(rets, lastErr)
-	return strings.Join(rets, ", ")
+	return "github.com/glassbox-go/" + filepath.Base(dir)
 }
 
-func getZeroValue(t string) string {
-	if strings.HasPrefix(t, "map[") {
-		return "nil"
+func writeFormatted(src []byte, outputPath string) {
+	formatted, err := imports.Process(outputPath, src, nil)
+	if err != nil {
+		fmt.Printf("[gobox-gen] WARNING: Failed to format %s: %v — writing unformatted\n", outputPath, err)
+		formatted = src
 	}
-	if strings.HasPrefix(t, "[]") {
-		return "nil"
-	}
-	switch t {
-	case "string":
-		return "\"\""
-	case "int", "int32", "int64", "uint32", "uint64", "float32", "float64":
-		return "0"
-	case "bool":
-		return "false"
-	default:
-		return "nil"
+	if err := os.WriteFile(outputPath, formatted, 0644); err != nil {
+		fmt.Printf("[gobox-gen] ERROR: Failed to write %s: %v\n", outputPath, err)
+	} else {
+		fmt.Printf("[gobox-gen] Generated: %s\n", outputPath)
 	}
 }
 
-func typeExprToString(expr ast.Expr) string {
+func typeExprToString(expr ast.Expr) (string, error) {
 	switch t := expr.(type) {
 	case *ast.Ident:
-		return t.Name
+		return t.Name, nil
 	case *ast.ArrayType:
-		return "[]" + typeExprToString(t.Elt)
+		e, err := typeExprToString(t.Elt)
+		return "[]" + e, err
 	case *ast.SelectorExpr:
-		return typeExprToString(t.X) + "." + t.Sel.Name
+		x, err := typeExprToString(t.X)
+		return x + "." + t.Sel.Name, err
+	case *ast.Ellipsis:
+		e, err := typeExprToString(t.Elt)
+		return "..." + e, err
 	case *ast.StarExpr:
-		return "*" + typeExprToString(t.X)
+		x, err := typeExprToString(t.X)
+		return "*" + x, err
 	case *ast.MapType:
-		return "map[" + typeExprToString(t.Key) + "]" + typeExprToString(t.Value)
+		k, errK := typeExprToString(t.Key)
+		v, errV := typeExprToString(t.Value)
+		if errK != nil { return "", errK }
+		if errV != nil { return "", errV }
+		return "map[" + k + "]" + v, nil
 	case *ast.InterfaceType:
-		return "interface{}"
+		return "interface{}", nil
+	case *ast.ChanType:
+		return "", fmt.Errorf("[gobox-gen] ERROR: Channel types are not supported for WASM serialization")
+	case *ast.FuncType:
+		return "", fmt.Errorf("[gobox-gen] ERROR: Function types are not supported for WASM serialization")
+	case *ast.StructType:
+		return "", fmt.Errorf("[gobox-gen] ERROR: Inline struct types are not supported for WASM serialization")
+	case *ast.IndexExpr:
+		x, errX := typeExprToString(t.X)
+		idx, errIdx := typeExprToString(t.Index)
+		if errX != nil { return "", errX }
+		if errIdx != nil { return "", errIdx }
+		return x + "[" + idx + "]", nil
+	case *ast.IndexListExpr:
+		x, errX := typeExprToString(t.X)
+		if errX != nil { return "", errX }
+		var indices []string
+		for _, idx := range t.Indices {
+			s, err := typeExprToString(idx)
+			if err != nil { return "", err }
+			indices = append(indices, s)
+		}
+		return x + "[" + strings.Join(indices, ", ") + "]", nil
 	default:
-		return fmt.Sprintf("%T", expr)
+		return fmt.Sprintf("%T", expr), nil
 	}
 }

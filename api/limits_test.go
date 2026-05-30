@@ -87,8 +87,8 @@ func TestSecurityGateFileSystem(t *testing.T) {
 
 	// Case 1: No limits in context -> allowed
 	ctx := context.Background()
-	if err := gate.CheckFileAccess(ctx, "/etc/passwd"); err != nil {
-		t.Errorf("Expected nil error for context without limits, got %v", err)
+	if err := gate.CheckFileAccess(ctx, "/etc/passwd"); err == nil {
+		t.Errorf("Expected error for context without limits, got nil")
 	}
 
 	// Case 2: Permissive mode -> allowed
@@ -146,8 +146,8 @@ func TestSecurityGateNetwork(t *testing.T) {
 
 	// Case 1: No limits in context -> allowed
 	ctx := context.Background()
-	if err := gate.CheckNetworkAccess(ctx, "google.com:443"); err != nil {
-		t.Errorf("Expected nil error for context without limits, got %v", err)
+	if err := gate.CheckNetworkAccess(ctx, "google.com:443"); err == nil {
+		t.Errorf("Expected error for context without limits, got nil")
 	}
 
 	// Case 2: Permissive mode -> allowed
@@ -202,14 +202,11 @@ func TestVirtualHTTPClient(t *testing.T) {
 
 	client := NewVirtualHTTPClient()
 
-	// Case 1: Unrestricted context -> should succeed
+	// Case 1: Unrestricted context -> should fail
 	ctx := context.Background()
-	resp, err := client.Fetch(ctx, server.URL)
-	if err != nil {
-		t.Fatalf("Fetch failed on unrestricted context: %v", err)
-	}
-	if resp != "mock response payload" {
-		t.Errorf("Expected 'mock response payload', got: %s", resp)
+	_, err = client.Fetch(ctx, server.URL)
+	if err == nil {
+		t.Fatalf("Fetch should fail on unrestricted context")
 	}
 
 	// Case 2: Restricted whitelisted context -> should succeed
@@ -217,7 +214,7 @@ func TestVirtualHTTPClient(t *testing.T) {
 		AllowNetworkAddresses(u.Host).
 		Build()
 	ctxRestricted := WithActiveLimits(ctx, limits)
-	resp, err = client.Fetch(ctxRestricted, server.URL)
+	resp, err := client.Fetch(ctxRestricted, server.URL)
 	if err != nil {
 		t.Fatalf("Fetch failed on whitelisted address: %v", err)
 	}

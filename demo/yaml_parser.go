@@ -22,3 +22,4 @@ func (y *YAMLParserImpl) Parse(ctx context.Context, data []byte) (map[string]int
 	}
 	return result, nil
 }
+

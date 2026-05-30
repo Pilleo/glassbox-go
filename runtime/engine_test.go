@@ -18,25 +18,45 @@ func TestSafeLogWriter(t *testing.T) {
 		loggedMsg = msg
 	}
 
-	writer := &safeLogWriter{
+	// Test stdout (LevelInfo)
+	stdoutWriter := &safeLogWriter{
 		logger: logger,
+		level:  gapi.LevelInfo,
 	}
 
-	// Write standard print log bytes with trailing newline
 	p := []byte("Hello wazero logger!\n")
-	n, err := writer.Write(p)
+	n, err := stdoutWriter.Write(p)
 	if err != nil {
 		t.Fatalf("Write failed: %v", err)
 	}
 	if n != len(p) {
 		t.Errorf("Expected n=%d, got: %d", len(p), n)
 	}
-
 	if loggedLvl != gapi.LevelInfo {
 		t.Errorf("Expected level INFO, got: %v", loggedLvl)
 	}
 	if loggedMsg != "Hello wazero logger!" { // Ensure trailing newline was stripped
 		t.Errorf("Expected stripped message, got: %s", loggedMsg)
+	}
+
+	// Test stderr (LevelWarn)
+	stderrWriter := &safeLogWriter{
+		logger: logger,
+		level:  gapi.LevelWarn,
+	}
+	stderrWriter.Write([]byte("panic: oh no\r\n"))
+	if loggedLvl != gapi.LevelWarn {
+		t.Errorf("Expected stderr to log at LevelWarn, got: %v", loggedLvl)
+	}
+	if loggedMsg != "panic: oh no" {
+		t.Errorf("Expected \\r\\n stripped, got: %q", loggedMsg)
+	}
+
+	// Test that a whitespace-only write is silently dropped
+	loggedMsg = ""
+	stdoutWriter.Write([]byte("\n"))
+	if loggedMsg != "" {
+		t.Errorf("Expected empty-only write to be dropped, but logger was called with: %q", loggedMsg)
 	}
 }
 

@@ -1,4 +1,4 @@
-package demo
+package pdf
 
 import (
 	"context"
@@ -9,13 +9,13 @@ import (
 
 //gobox:sandbox
 type PDFProcessor interface {
-	ExtractTextFromFile(ctx context.Context, path string) (string, error)
+	ExtractTextFromFile(ctx context.Context, path gapi.SandboxPath) (string, error)
 }
 
 // PDFProcessorImpl extracts and processes contents of local files.
 type PDFProcessorImpl struct{}
 
-func (p *PDFProcessorImpl) ExtractTextFromFile(ctx context.Context, path string) (string, error) {
+func (p *PDFProcessorImpl) ExtractTextFromFile(ctx context.Context, path gapi.SandboxPath) (string, error) {
 	// Check context cancellation/timeout early
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -23,12 +23,12 @@ func (p *PDFProcessorImpl) ExtractTextFromFile(ctx context.Context, path string)
 
 	// Assert filesystem capability boundaries before reading
 	gate := &gapi.SecurityGate{}
-	if err := gate.CheckFileAccess(ctx, path); err != nil {
+	if err := gate.CheckFileAccess(ctx, string(path)); err != nil {
 		return "", err
 	}
 
 	// Read and extract content, validating filesystem isolation
-	bytes, err := os.ReadFile(path)
+	bytes, err := os.ReadFile(string(path))
 	if err != nil {
 		return "", err
 	}
