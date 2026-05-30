@@ -227,7 +227,7 @@ func (e *Engine) GetInstance(ctx context.Context, moduleName string, limits *gap
 		e.cacheMutex.Unlock()
 
 		e.cacheMutex.RLock()
-		if e.limitedCache[memLimit] != nil {
+		if e.limitedRTs[memLimit] == currentLRT && e.limitedCache[memLimit] != nil {
 			compiled = e.limitedCache[memLimit][moduleName]
 		}
 		e.cacheMutex.RUnlock()
@@ -246,7 +246,7 @@ func (e *Engine) GetInstance(ctx context.Context, moduleName string, limits *gap
 				}
 
 				e.cacheMutex.Lock()
-				if e.limitedCache[memLimit] != nil {
+				if e.limitedRTs[memLimit] == currentLRT && e.limitedCache[memLimit] != nil {
 					e.limitedCache[memLimit][moduleName] = compiledMod
 				}
 				e.cacheMutex.Unlock()
