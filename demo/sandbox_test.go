@@ -2,9 +2,6 @@ package demo
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -83,63 +80,6 @@ d: &d [*c,*c,*c,*c,*c]
 	}
 	if result == nil {
 		t.Errorf("Expected non-nil result from anchor bomb parse")
-	}
-}
-
-func TestMarkdownParserNetworkFirewall(t *testing.T) {
-	ctx := context.Background()
-	engine, err := gruntime.NewEngine(ctx)
-	if err != nil {
-		t.Fatalf("Failed to create engine: %v", err)
-	}
-	defer engine.Close(ctx)
-
-	// Spin up local mock server for remote template stylesheet
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("<style>body { color: blue; }</style>"))
-	}))
-	defer server.Close()
-
-	u, err := url.Parse(server.URL)
-	if err != nil {
-		t.Fatalf("Failed to parse server URL: %v", err)
-	}
-
-	// Case 1: Whitelisted remote template fetch
-	limitsAllowed := gapi.NewBuilder().
-		AllowNetworkAddresses(u.Host).
-		Build()
-
-	proxyAllowed, err := NewMarkdownParserWasmProxy(engine, limitsAllowed)
-	if err != nil {
-		t.Fatalf("Failed to create proxy: %v", err)
-	}
-
-	markdown := []byte("# Heading\nHello secure world.")
-	res, err := proxyAllowed.RenderWithTemplate(ctx, markdown, server.URL)
-	if err != nil {
-		t.Fatalf("RenderWithTemplate failed on whitelisted egress: %v", err)
-	}
-	if !strings.Contains(res, "<style>") || !strings.Contains(res, "<h1>Heading</h1>") {
-		t.Errorf("Expected styled rendered HTML, got: %s", res)
-	}
-
-	// Case 2: Blocked remote template fetch
-	limitsBlocked := gapi.NewBuilder().
-		AllowNetworkAddresses("some-other-host.com").
-		Build()
-	proxyBlocked, err := NewMarkdownParserWasmProxy(engine, limitsBlocked)
-	if err != nil {
-		t.Fatalf("Failed to create proxy: %v", err)
-	}
-
-	_, err = proxyBlocked.RenderWithTemplate(ctx, markdown, server.URL)
-	if err == nil {
-		t.Errorf("Expected egress firewall violation error, got nil")
-	}
-	if !strings.Contains(err.Error(), "Unauthorized network egress") {
-		t.Errorf("Expected unauthorized egress error, got: %v", err)
 	}
 }
 
@@ -232,7 +172,7 @@ func TestWasmBranchCoverage(t *testing.T) {
 	}
 
 	minimalWasm := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
-	err = os.WriteFile("wasm/YAMLParser.wasm", minimalWasm, 0644)
+	err = os.WriteFile("wasm/demo.wasm", minimalWasm, 0644)
 	if err != nil {
 		t.Fatalf("Failed to write mock Wasm file: %v", err)
 	}

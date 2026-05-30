@@ -25,6 +25,11 @@ import "context"
 type MockProcessor interface {
 	ProcessData(ctx context.Context, input []byte, ptr *int) ([]*byte, error)
 }
+
+type MockProcessorImpl struct{}
+func (m *MockProcessorImpl) ProcessData(ctx context.Context, input []byte, ptr *int) ([]*byte, error) {
+	return nil, nil
+}
 `
 	mockFilePath := filepath.Join(tempDir, "mock_processor.go")
 	err = os.WriteFile(mockFilePath, []byte(mockSrc), 0644)
@@ -33,13 +38,15 @@ type MockProcessor interface {
 	}
 
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, mockFilePath, nil, parser.ParseComments)
+	pkgs, err := parser.ParseDir(fset, tempDir, nil, parser.ParseComments)
 	if err != nil {
 		t.Fatalf("Failed to parse mock source: %v", err)
 	}
 
 	// Run AST parser and code generator
-	processFile(mockFilePath, file, tempDir)
+	for _, pkg := range pkgs {
+		processPackage(pkg, tempDir)
+	}
 
 	// Assert proxy file was successfully generated
 	generatedProxyPath := filepath.Join(tempDir, "mockprocessor_proxy.go")
@@ -66,5 +73,11 @@ type MockProcessor interface {
 		if !strings.Contains(content, expected) {
 			t.Errorf("Expected generated proxy content to contain '%s', but it was not found", expected)
 		}
+	}
+
+	// Assert guest file was generated
+	generatedGuestPath := filepath.Join(tempDir, "guest", "main.go")
+	if _, err := os.Stat(generatedGuestPath); os.IsNotExist(err) {
+		t.Errorf("Expected generated guest file at %s, but it does not exist", generatedGuestPath)
 	}
 }

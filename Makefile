@@ -12,16 +12,14 @@ test:
 tidy:
 	go mod tidy
 
-# Run AOT proxy generator
+# Run AOT proxy generator (generates both host proxies and guest shim)
 gen:
 	go run generator/generator.go -dir=demo
 
-# Compile guest Go logic into WASIP1 WASM binaries and establish module aliases
+# Compile guest Go logic into WASIP1 WASM binary (per package)
 build-wasm:
 	mkdir -p wasm
-	GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o wasm/YAMLParser.wasm demo/guest/main.go
-	cp wasm/YAMLParser.wasm wasm/MarkdownParser.wasm
-	cp wasm/YAMLParser.wasm wasm/PDFProcessor.wasm
+	GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o wasm/demo.wasm ./demo/guest/
 
 # Run the complete build-time automation script
 build-all: build-wasm
@@ -30,4 +28,5 @@ build-all: build-wasm
 # Clean generated proxy files and compiled Wasm binaries
 clean:
 	rm -f demo/*_proxy.go
+	rm -rf demo/guest/
 	rm -rf wasm/

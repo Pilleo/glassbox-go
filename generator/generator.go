@@ -32,9 +32,7 @@ func main() {
 	}
 
 	for _, pkg := range pkgs {
-		for fileName, file := range pkg.Files {
-			processFile(fileName, file, absPath)
-		}
+		processPackage(pkg, absPath)
 	}
 }
 
@@ -49,106 +47,123 @@ type paramSpec struct {
 	Type string
 }
 
-func processFile(fileName string, file *ast.File, absPath string) {
-	packageName := file.Name.Name
+type interfaceSpec struct {
+	Name    string
+	Methods []methodSpec
+}
 
-	ast.Inspect(file, func(n ast.Node) bool {
-		decl, ok := n.(*ast.GenDecl)
-		if !ok || decl.Tok != token.TYPE {
-			return true
-		}
+func processPackage(pkg *ast.Package, absPath string) {
+	var sandboxedInterfaces []interfaceSpec
+	packageName := pkg.Name
 
-		isSandboxed := false
-		if decl.Doc != nil {
-			for _, comment := range decl.Doc.List {
-				if strings.Contains(comment.Text, "//gobox:sandbox") {
-					isSandboxed = true
-					break
-				}
+	for _, file := range pkg.Files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			decl, ok := n.(*ast.GenDecl)
+			if !ok || decl.Tok != token.TYPE {
+				return true
 			}
-		}
 
-		if isSandboxed {
-			for _, spec := range decl.Specs {
-				typeSpec, ok := spec.(*ast.TypeSpec)
-				if !ok {
-					continue
-				}
-				interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
-				if !ok {
-					continue
-				}
-				interfaceName := typeSpec.Name.Name
-				
-				// AST Validation: Reject embedded interfaces
-				valid := true
-				for _, field := range interfaceType.Methods.List {
-					if len(field.Names) == 0 {
-						fmt.Printf("[gobox-gen] ERROR: Interface %s contains an embedded interface. Glassbox currently does not support proxying embedded interfaces.\n", interfaceName)
-						valid = false
+			isSandboxed := false
+			if decl.Doc != nil {
+				for _, comment := range decl.Doc.List {
+					if strings.Contains(comment.Text, "//gobox:sandbox") {
+						isSandboxed = true
 						break
 					}
 				}
-				if !valid {
-					continue
-				}
-				
-				fmt.Printf("[gobox-gen] Found Sandboxed Interface: %s\n", interfaceName)
-				generateProxy(packageName, interfaceName, interfaceType, absPath)
 			}
-		}
 
-		return true
-	})
-}
-
-func generateProxy(packageName string, interfaceName string, interfaceType *ast.InterfaceType, absPath string) {
-	var methods []methodSpec
-
-	for _, field := range interfaceType.Methods.List {
-		funcType, ok := field.Type.(*ast.FuncType)
-		if !ok {
-			continue
-		}
-
-		methodName := field.Names[0].Name
-		var params []paramSpec
-		var results []paramSpec
-
-		// Parse parameters
-		if funcType.Params != nil {
-			for idx, p := range funcType.Params.List {
-				pType := typeExprToString(p.Type)
-				if len(p.Names) > 0 {
-					for _, name := range p.Names {
-						params = append(params, paramSpec{Name: name.Name, Type: pType})
+			if isSandboxed {
+				for _, spec := range decl.Specs {
+					typeSpec, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
 					}
-				} else {
-					params = append(params, paramSpec{Name: fmt.Sprintf("arg%d", idx), Type: pType})
+					interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
+					if !ok {
+						continue
+					}
+					interfaceName := typeSpec.Name.Name
+					
+					// AST Validation: Reject embedded interfaces
+					valid := true
+					for _, field := range interfaceType.Methods.List {
+						if len(field.Names) == 0 {
+							fmt.Printf("[gobox-gen] ERROR: Interface %s contains an embedded interface. Glassbox currently does not support proxying embedded interfaces.\n", interfaceName)
+							valid = false
+							break
+						}
+					}
+					if !valid {
+						continue
+					}
+					
+					fmt.Printf("[gobox-gen] Found Sandboxed Interface: %s\n", interfaceName)
+					
+					intfSpec := interfaceSpec{Name: interfaceName}
+					for _, field := range interfaceType.Methods.List {
+						funcType, ok := field.Type.(*ast.FuncType)
+						if !ok {
+							continue
+						}
+
+						methodName := field.Names[0].Name
+						var params []paramSpec
+						var results []paramSpec
+
+						// Parse parameters
+						if funcType.Params != nil {
+							for idx, p := range funcType.Params.List {
+								pType := typeExprToString(p.Type)
+								if len(p.Names) > 0 {
+									for _, name := range p.Names {
+										params = append(params, paramSpec{Name: name.Name, Type: pType})
+									}
+								} else {
+									params = append(params, paramSpec{Name: fmt.Sprintf("arg%d", idx), Type: pType})
+								}
+							}
+						}
+
+						// Parse results
+						if funcType.Results != nil {
+							for idx, r := range funcType.Results.List {
+								rType := typeExprToString(r.Type)
+								rName := ""
+								if len(r.Names) > 0 {
+									rName = r.Names[0].Name
+								} else {
+									rName = fmt.Sprintf("ret%d", idx)
+								}
+								results = append(results, paramSpec{Name: rName, Type: rType})
+							}
+						}
+
+						intfSpec.Methods = append(intfSpec.Methods, methodSpec{
+							Name:    methodName,
+							Params:  params,
+							Results: results,
+						})
+					}
+					sandboxedInterfaces = append(sandboxedInterfaces, intfSpec)
 				}
 			}
-		}
 
-		// Parse results
-		if funcType.Results != nil {
-			for idx, r := range funcType.Results.List {
-				rType := typeExprToString(r.Type)
-				rName := ""
-				if len(r.Names) > 0 {
-					rName = r.Names[0].Name
-				} else {
-					rName = fmt.Sprintf("ret%d", idx)
-				}
-				results = append(results, paramSpec{Name: rName, Type: rType})
-			}
-		}
-
-		methods = append(methods, methodSpec{
-			Name:    methodName,
-			Params:  params,
-			Results: results,
+			return true
 		})
 	}
+
+	if len(sandboxedInterfaces) > 0 {
+		for _, intf := range sandboxedInterfaces {
+			generateProxy(packageName, intf, absPath)
+		}
+		generateGuest(packageName, sandboxedInterfaces, absPath)
+	}
+}
+
+func generateProxy(packageName string, intf interfaceSpec, absPath string) {
+	interfaceName := intf.Name
+	methods := intf.Methods
 
 	// Construct proxy source code
 	var buf bytes.Buffer
@@ -179,9 +194,9 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 	buf.WriteString("\t}\n")
 	buf.WriteString("\t// Eagerly verify module is compilable/instantiable and initialize the pool\n")
 	buf.WriteString("\tctx := context.Background()\n")
-	buf.WriteString(fmt.Sprintf("\tmod, err := engine.GetInstance(ctx, \"%s\", limits)\n", interfaceName))
+	buf.WriteString(fmt.Sprintf("\tmod, err := engine.GetInstance(ctx, \"%s\", limits)\n", packageName)) // Use packageName here!
 	buf.WriteString("\tif err != nil {\n")
-	buf.WriteString(fmt.Sprintf("\t\treturn nil, gapi.NewSandboxSecurityError(fmt.Sprintf(\"Failed to initialize secure Wasm sandbox for %s: %%v\", err))\n", interfaceName))
+	buf.WriteString(fmt.Sprintf("\t\treturn nil, gapi.NewSandboxSecurityError(fmt.Sprintf(\"Failed to initialize secure Wasm sandbox for %s: %%v\", err))\n", packageName))
 	buf.WriteString("\t}\n")
 	
 	buf.WriteString("\tif mod.ExportedFunction(\"malloc\") == nil {\n")
@@ -226,7 +241,7 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 	buf.WriteString("\tcase mod := <-p.pool:\n")
 	buf.WriteString("\t\treturn mod, nil\n")
 	buf.WriteString("\tdefault:\n")
-	buf.WriteString(fmt.Sprintf("\t\treturn p.engine.GetInstance(ctx, \"%s\", p.limits)\n", interfaceName))
+	buf.WriteString(fmt.Sprintf("\t\treturn p.engine.GetInstance(ctx, \"%s\", p.limits)\n", packageName))
 	buf.WriteString("\t}\n")
 	buf.WriteString("}\n\n")
 
@@ -384,6 +399,138 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 		fmt.Printf("Failed to write generated proxy file: %v\n", err)
 	} else {
 		fmt.Printf("[gobox-gen] Successfully generated proxy: %s\n", outputPath)
+	}
+}
+
+func generateGuest(packageName string, interfaces []interfaceSpec, absPath string) {
+	guestDir := filepath.Join(absPath, "guest")
+	if err := os.MkdirAll(guestDir, 0755); err != nil {
+		fmt.Printf("Failed to create guest directory: %v\n", err)
+		return
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("// Code generated by gobox-gen. DO NOT EDIT.\n")
+	buf.WriteString("package main\n\n")
+	buf.WriteString("import (\n")
+	buf.WriteString("\t\"context\"\n")
+	buf.WriteString("\t\"unsafe\"\n")
+	buf.WriteString("\t\"github.com/glassbox-go/binarybridge\"\n")
+	
+	pkgPath := "github.com/glassbox-go/" + filepath.Base(absPath)
+	buf.WriteString(fmt.Sprintf("\t\"%s\"\n", pkgPath))
+	buf.WriteString(")\n\n")
+
+	buf.WriteString("func main() {}\n\n")
+	buf.WriteString("var allocations = make(map[uintptr][]byte)\n\n")
+	
+	buf.WriteString("//go:wasmexport malloc\n")
+	buf.WriteString("func malloc(size uint32) *byte {\n")
+	buf.WriteString("\tbuf := make([]byte, size)\n")
+	buf.WriteString("\tptr := &buf[0]\n")
+	buf.WriteString("\tallocations[uintptr(unsafe.Pointer(ptr))] = buf\n")
+	buf.WriteString("\treturn ptr\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString("//go:wasmexport free\n")
+	buf.WriteString("func free(ptr *byte) {\n")
+	buf.WriteString("\tdelete(allocations, uintptr(unsafe.Pointer(ptr)))\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString("func keepAliveAndPack(buf []byte) uint64 {\n")
+	buf.WriteString("\tptr := &buf[0]\n")
+	buf.WriteString("\tallocations[uintptr(unsafe.Pointer(ptr))] = buf\n")
+	buf.WriteString("\treturn (uint64(uint32(uintptr(unsafe.Pointer(ptr)))) << 32) | uint64(len(buf))\n")
+	buf.WriteString("}\n\n")
+
+	for _, intf := range interfaces {
+		buf.WriteString(fmt.Sprintf("// --- %s ---\n", intf.Name))
+		buf.WriteString(fmt.Sprintf("var %sImpl = &%s.%sImpl{}\n\n", strings.ToLower(intf.Name), packageName, intf.Name))
+
+		for _, method := range intf.Methods {
+			buf.WriteString(fmt.Sprintf("//go:wasmexport %s\n", method.Name))
+			buf.WriteString(fmt.Sprintf("func %s(ptr *byte, size uint32) uint64 {\n", method.Name))
+			buf.WriteString("\tpayload := unsafe.Slice(ptr, size)\n")
+			buf.WriteString("\tvar args []interface{}\n")
+			buf.WriteString("\t_ = binarybridge.DeserializeFromBytes(payload, &args)\n\n")
+
+			var callArgs []string
+			argIdx := 0
+			for _, p := range method.Params {
+				if p.Type == "context.Context" || p.Type == "Context" {
+					callArgs = append(callArgs, "context.Background()")
+				} else {
+					buf.WriteString(fmt.Sprintf("\tvar arg%d %s\n", argIdx, p.Type))
+					buf.WriteString(fmt.Sprintf("\tif len(args) > %d {\n", argIdx))
+					// Basic type assertion
+					buf.WriteString(fmt.Sprintf("\t\tif val, ok := args[%d].(%s); ok {\n", argIdx, p.Type))
+					buf.WriteString(fmt.Sprintf("\t\t\targ%d = val\n", argIdx))
+					buf.WriteString("\t\t}\n")
+					buf.WriteString("\t}\n")
+					callArgs = append(callArgs, fmt.Sprintf("arg%d", argIdx))
+					argIdx++
+				}
+			}
+
+			// Do the call
+			var retVars []string
+			hasError := false
+			for i, r := range method.Results {
+				if r.Type == "error" {
+					hasError = true
+					retVars = append(retVars, "err")
+				} else {
+					retVars = append(retVars, fmt.Sprintf("ret%d", i))
+				}
+			}
+
+			callStr := ""
+			if len(retVars) > 0 {
+				callStr = strings.Join(retVars, ", ") + " := "
+			}
+			callStr += fmt.Sprintf("%sImpl.%s(%s)\n", strings.ToLower(intf.Name), method.Name, strings.Join(callArgs, ", "))
+			buf.WriteString("\t" + callStr)
+
+			var serializeArgs []string
+			if hasError {
+				buf.WriteString("\tvar errOut string\n")
+				buf.WriteString("\tif err != nil {\n")
+				buf.WriteString("\t\terrOut = err.Error()\n")
+				buf.WriteString("\t}\n")
+			}
+
+			for i, r := range method.Results {
+				if r.Type == "error" {
+					serializeArgs = append(serializeArgs, "errOut")
+				} else {
+					serializeArgs = append(serializeArgs, fmt.Sprintf("ret%d", i))
+				}
+			}
+
+			buf.WriteString("\tretBytes, _ := binarybridge.SerializeAsBytes([]interface{}{\n")
+			for _, sa := range serializeArgs {
+				buf.WriteString(fmt.Sprintf("\t\t%s,\n", sa))
+			}
+			buf.WriteString("\t})\n\n")
+
+			buf.WriteString("\treturn keepAliveAndPack(retBytes)\n")
+			buf.WriteString("}\n\n")
+		}
+	}
+
+	outputPath := filepath.Join(guestDir, "main.go")
+	
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		fmt.Printf("Failed to format generated guest file: %v\n", err)
+		formatted = buf.Bytes()
+	}
+
+	err = os.WriteFile(outputPath, formatted, 0644)
+	if err != nil {
+		fmt.Printf("Failed to write generated guest file: %v\n", err)
+	} else {
+		fmt.Printf("[gobox-gen] Successfully generated guest shim: %s\n", outputPath)
 	}
 }
 
