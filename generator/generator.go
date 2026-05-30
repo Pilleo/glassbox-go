@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
@@ -78,6 +79,20 @@ func processFile(fileName string, file *ast.File, absPath string) {
 					continue
 				}
 				interfaceName := typeSpec.Name.Name
+				
+				// AST Validation: Reject embedded interfaces
+				valid := true
+				for _, field := range interfaceType.Methods.List {
+					if len(field.Names) == 0 {
+						fmt.Printf("[gobox-gen] ERROR: Interface %s contains an embedded interface. Glassbox currently does not support proxying embedded interfaces.\n", interfaceName)
+						valid = false
+						break
+					}
+				}
+				if !valid {
+					continue
+				}
+				
 				fmt.Printf("[gobox-gen] Found Sandboxed Interface: %s\n", interfaceName)
 				generateProxy(packageName, interfaceName, interfaceType, absPath)
 			}
@@ -141,38 +156,93 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 	buf.WriteString("import (\n")
 	buf.WriteString("\t\"context\"\n")
 	buf.WriteString("\t\"fmt\"\n")
+	buf.WriteString("\t\"github.com/tetratelabs/wazero/api\"\n")
 	buf.WriteString("\tgapi \"github.com/glassbox-go/api\"\n")
 	buf.WriteString("\tgbridge \"github.com/glassbox-go/binarybridge\"\n")
 	buf.WriteString("\tgruntime \"github.com/glassbox-go/runtime\"\n")
 	buf.WriteString(")\n\n")
 
 	buf.WriteString(fmt.Sprintf("type %sWasmProxy struct {\n", interfaceName))
-	buf.WriteString("\tlimits   *gapi.SandboxLimits\n")
+	buf.WriteString("\tengine *gruntime.Engine\n")
+	buf.WriteString("\tlimits *gapi.SandboxLimits\n")
+	buf.WriteString("\tpool   chan api.Module\n")
 	buf.WriteString("}\n\n")
 
-	buf.WriteString(fmt.Sprintf("func New%sWasmProxy(limits *gapi.SandboxLimits) *%sWasmProxy {\n", interfaceName, interfaceName))
+	buf.WriteString(fmt.Sprintf("var _ %s = (*%sWasmProxy)(nil)\n\n", interfaceName, interfaceName))
+
+	buf.WriteString(fmt.Sprintf("func New%sWasmProxy(engine *gruntime.Engine, limits *gapi.SandboxLimits) (*%sWasmProxy, error) {\n", interfaceName, interfaceName))
 	buf.WriteString("\tif limits == nil {\n")
 	buf.WriteString("\t\tlimits = gapi.NewBuilder().Build()\n")
 	buf.WriteString("\t}\n")
-	buf.WriteString("\t// Eagerly verify module is compilable/instantiable\n")
-	buf.WriteString("\tctx := context.Background()\n")
-	buf.WriteString(fmt.Sprintf("\tmod, err := gruntime.GetInstance(ctx, \"%s\", limits)\n", interfaceName))
-	buf.WriteString("\tif err != nil {\n")
-	buf.WriteString(fmt.Sprintf("\t\tpanic(gapi.NewSandboxSecurityError(fmt.Sprintf(\"Failed to initialize secure Wasm sandbox for %s: %%v\", err)))\n", interfaceName))
+	buf.WriteString("\tif engine == nil {\n")
+	buf.WriteString("\t\treturn nil, fmt.Errorf(\"engine cannot be nil\")\n")
 	buf.WriteString("\t}\n")
+	buf.WriteString("\t// Eagerly verify module is compilable/instantiable and initialize the pool\n")
+	buf.WriteString("\tctx := context.Background()\n")
+	buf.WriteString(fmt.Sprintf("\tmod, err := engine.GetInstance(ctx, \"%s\", limits)\n", interfaceName))
+	buf.WriteString("\tif err != nil {\n")
+	buf.WriteString(fmt.Sprintf("\t\treturn nil, gapi.NewSandboxSecurityError(fmt.Sprintf(\"Failed to initialize secure Wasm sandbox for %s: %%v\", err))\n", interfaceName))
+	buf.WriteString("\t}\n")
+	
+	buf.WriteString("\tif mod.ExportedFunction(\"malloc\") == nil {\n")
+	buf.WriteString("\t\tmod.Close(ctx)\n")
+	buf.WriteString("\t\treturn nil, gapi.NewSandboxSecurityError(\"wasm module does not export malloc\")\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\tif mod.ExportedFunction(\"free\") == nil {\n")
+	buf.WriteString("\t\tmod.Close(ctx)\n")
+	buf.WriteString("\t\treturn nil, gapi.NewSandboxSecurityError(\"wasm module does not export free\")\n")
+	buf.WriteString("\t}\n")
+	for _, method := range methods {
+		buf.WriteString(fmt.Sprintf("\tif mod.ExportedFunction(\"%s\") == nil {\n", method.Name))
+		buf.WriteString("\t\tmod.Close(ctx)\n")
+		buf.WriteString(fmt.Sprintf("\t\treturn nil, gapi.NewSandboxSecurityError(\"wasm module does not export %s\")\n", method.Name))
+		buf.WriteString("\t}\n")
+	}
+
 	buf.WriteString("\tmod.Close(ctx)\n\n")
-	buf.WriteString(fmt.Sprintf("\treturn &%sWasmProxy{\n", interfaceName))
-	buf.WriteString("\t\tlimits:   limits,\n")
+
+	buf.WriteString(fmt.Sprintf("\tp := &%sWasmProxy{\n", interfaceName))
+	buf.WriteString("\t\tengine: engine,\n")
+	buf.WriteString("\t\tlimits: limits,\n")
+	buf.WriteString("\t\tpool:   make(chan api.Module, 10), // Buffered pool for reuse\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\treturn p, nil\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString(fmt.Sprintf("func (p *%sWasmProxy) Close() error {\n", interfaceName))
+	buf.WriteString("\tctx := context.Background()\n")
+	buf.WriteString("\tfor {\n")
+	buf.WriteString("\t\tselect {\n")
+	buf.WriteString("\t\tcase mod := <-p.pool:\n")
+	buf.WriteString("\t\t\tmod.Close(ctx)\n")
+	buf.WriteString("\t\tdefault:\n")
+	buf.WriteString("\t\t\treturn nil\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString(fmt.Sprintf("func (p *%sWasmProxy) acquireModule(ctx context.Context) (api.Module, error) {\n", interfaceName))
+	buf.WriteString("\tselect {\n")
+	buf.WriteString("\tcase mod := <-p.pool:\n")
+	buf.WriteString("\t\treturn mod, nil\n")
+	buf.WriteString("\tdefault:\n")
+	buf.WriteString(fmt.Sprintf("\t\treturn p.engine.GetInstance(ctx, \"%s\", p.limits)\n", interfaceName))
+	buf.WriteString("\t}\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString(fmt.Sprintf("func (p *%sWasmProxy) releaseModule(mod api.Module) {\n", interfaceName))
+	buf.WriteString("\tselect {\n")
+	buf.WriteString("\tcase p.pool <- mod:\n")
+	buf.WriteString("\tdefault:\n")
+	buf.WriteString("\t\tmod.Close(context.Background())\n")
 	buf.WriteString("\t}\n")
 	buf.WriteString("}\n\n")
 
 	// Write method implementations
 	for _, method := range methods {
 		paramList := []string{}
-		argNames := []string{}
 		for _, p := range method.Params {
 			paramList = append(paramList, fmt.Sprintf("%s %s", p.Name, p.Type))
-			argNames = append(argNames, p.Name)
 		}
 
 		resultTypes := []string{}
@@ -229,12 +299,13 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"serialization failed: %w\", err)")))
 		buf.WriteString("\t\t}\n\n")
 
-		buf.WriteString("\t\t// Get JIT compiled module and allocate memory via guest malloc\n")
-		buf.WriteString(fmt.Sprintf("\t\tmod, err := gruntime.GetInstance(ctx, \"%s\", p.limits)\n", interfaceName))
+		buf.WriteString("\t\t// Get a module from the pool\n")
+		buf.WriteString("\t\tmod, err := p.acquireModule(ctx)\n")
 		buf.WriteString("\t\tif err != nil {\n")
 		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"failed to get sandbox instance: %w\", err)")))
 		buf.WriteString("\t\t}\n")
-		buf.WriteString("\t\tdefer mod.Close(ctx)\n")
+		buf.WriteString("\t\tdefer p.releaseModule(mod)\n\n")
+
 		buf.WriteString("\t\tmalloc := mod.ExportedFunction(\"malloc\")\n")
 		buf.WriteString("\t\tif malloc == nil {\n")
 		buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"wasm module does not export malloc\")")))
@@ -272,7 +343,12 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 		buf.WriteString("\t\t}\n\n")
 
 		if len(method.Results) > 0 {
-			buf.WriteString("\t\tvar outResults []interface{}\n")
+			buf.WriteString("\t\t// Use a local struct for direct deserialization to fix struct type assertion bug\n")
+			buf.WriteString("\t\tvar outResults struct {\n")
+			for idx, r := range method.Results {
+				buf.WriteString(fmt.Sprintf("\t\t\tRet%d %s\n", idx, r.Type))
+			}
+			buf.WriteString("\t\t}\n")
 			buf.WriteString("\t\terr = gbridge.DeserializeFromBytes(retBytes, &outResults)\n")
 			buf.WriteString("\t\tif err != nil {\n")
 			buf.WriteString(fmt.Sprintf("\t\t\treturn %s\n", generateZeroReturns(method.Results, "fmt.Errorf(\"deserialization failed: %w\", err)")))
@@ -281,20 +357,10 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 			var rets []string
 			for idx, r := range method.Results {
 				if r.Type == "error" {
-					buf.WriteString(fmt.Sprintf("\t\tvar val%d error\n", idx))
-					buf.WriteString(fmt.Sprintf("\t\tif outResults[%d] != nil {\n", idx))
-					buf.WriteString(fmt.Sprintf("\t\t\tif errStr, ok := outResults[%d].(string); ok && errStr != \"\" {\n", idx))
-					buf.WriteString(fmt.Sprintf("\t\t\t\tval%d = fmt.Errorf(\"%%s\", errStr)\n", idx))
-					buf.WriteString(fmt.Sprintf("\t\t\t} else if errMap, ok := outResults[%d].(map[string]interface{}); ok {\n", idx))
-					buf.WriteString("\t\t\t\tif msg, exists := errMap[\"Message\"]; exists && msg != \"\" {\n")
-					buf.WriteString(fmt.Sprintf("\t\t\t\t\tval%d = fmt.Errorf(\"%%v\", msg)\n", idx))
-					buf.WriteString("\t\t\t\t}\n")
-					buf.WriteString("\t\t\t}\n")
-					buf.WriteString("\t\t}\n")
+					rets = append(rets, fmt.Sprintf("gbridge.UnmarshalError(outResults.Ret%d)", idx))
 				} else {
-					buf.WriteString(fmt.Sprintf("\t\tval%d, _ := outResults[%d].(%s)\n", idx, idx, r.Type))
+					rets = append(rets, fmt.Sprintf("outResults.Ret%d", idx))
 				}
-				rets = append(rets, fmt.Sprintf("val%d", idx))
 			}
 			buf.WriteString(fmt.Sprintf("\t\treturn %s\n", strings.Join(rets, ", ")))
 		} else {
@@ -304,7 +370,16 @@ func generateProxy(packageName string, interfaceName string, interfaceType *ast.
 	}
 
 	outputPath := filepath.Join(absPath, fmt.Sprintf("%s_proxy.go", strings.ToLower(interfaceName)))
-	err := os.WriteFile(outputPath, buf.Bytes(), 0644)
+	
+	// Format the source code before writing
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		fmt.Printf("Failed to format generated proxy file: %v\n", err)
+		// Fallback to unformatted if formatting fails
+		formatted = buf.Bytes()
+	}
+
+	err = os.WriteFile(outputPath, formatted, 0644)
 	if err != nil {
 		fmt.Printf("Failed to write generated proxy file: %v\n", err)
 	} else {

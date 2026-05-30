@@ -16,10 +16,19 @@ import (
 	gruntime "github.com/glassbox-go/runtime"
 )
 
-
 func TestYAMLParserSuccess(t *testing.T) {
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
 	limits := gapi.NewBuilder().Build()
-	proxy := NewYAMLParserWasmProxy(limits)
+	proxy, err := NewYAMLParserWasmProxy(engine, limits)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
 
 	yamlData := []byte(`
 name: Glassbox-Go
@@ -29,7 +38,6 @@ tags:
   - sandboxed
 `)
 
-	ctx := context.Background()
 	result, err := proxy.Parse(ctx, yamlData)
 	if err != nil {
 		t.Fatalf("Parse failed: %v", err)
@@ -44,6 +52,13 @@ tags:
 }
 
 func TestYAMLParserAnchorBombVulnerability(t *testing.T) {
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
 	// A small Billion Laughs YAML Anchor Bomb payload.
 	// This creates nested expansions that explode in memory.
 	anchorBomb := []byte(`
@@ -54,9 +69,11 @@ d: &d [*c,*c,*c,*c,*c]
 `)
 
 	limits := gapi.NewBuilder().Build()
-	proxy := NewYAMLParserWasmProxy(limits)
+	proxy, err := NewYAMLParserWasmProxy(engine, limits)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
 
-	ctx := context.Background()
 	// An unsandboxed parser would expand this recursively on the heap.
 	// In the fallback on the host, it completes because we kept depth small (5^4 = 625 elements),
 	// but it demonstrates the recursive structural pressure.
@@ -70,6 +87,13 @@ d: &d [*c,*c,*c,*c,*c]
 }
 
 func TestMarkdownParserNetworkFirewall(t *testing.T) {
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
 	// Spin up local mock server for remote template stylesheet
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -84,13 +108,14 @@ func TestMarkdownParserNetworkFirewall(t *testing.T) {
 
 	// Case 1: Whitelisted remote template fetch
 	limitsAllowed := gapi.NewBuilder().
-		Strict(true).
-		AllowNetworkAddresses([]string{u.Host}).
+		AllowNetworkAddresses(u.Host).
 		Build()
 
-	proxyAllowed := NewMarkdownParserWasmProxy(limitsAllowed)
+	proxyAllowed, err := NewMarkdownParserWasmProxy(engine, limitsAllowed)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
 
-	ctx := context.Background()
 	markdown := []byte("# Heading\nHello secure world.")
 	res, err := proxyAllowed.RenderWithTemplate(ctx, markdown, server.URL)
 	if err != nil {
@@ -102,10 +127,12 @@ func TestMarkdownParserNetworkFirewall(t *testing.T) {
 
 	// Case 2: Blocked remote template fetch
 	limitsBlocked := gapi.NewBuilder().
-		Strict(true).
-		AllowNetworkAddresses([]string{"some-other-host.com"}).
+		AllowNetworkAddresses("some-other-host.com").
 		Build()
-	proxyBlocked := NewMarkdownParserWasmProxy(limitsBlocked)
+	proxyBlocked, err := NewMarkdownParserWasmProxy(engine, limitsBlocked)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
 
 	_, err = proxyBlocked.RenderWithTemplate(ctx, markdown, server.URL)
 	if err == nil {
@@ -117,6 +144,13 @@ func TestMarkdownParserNetworkFirewall(t *testing.T) {
 }
 
 func TestPDFProcessorFilesystemGate(t *testing.T) {
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
 	tempDir, err := os.MkdirTemp("", "pdf-sandbox-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -130,13 +164,13 @@ func TestPDFProcessorFilesystemGate(t *testing.T) {
 	}
 
 	limits := gapi.NewBuilder().
-		Strict(true).
 		AllowFileSystemAccess(tempDir).
 		Build()
 
-	proxy := NewPDFProcessorWasmProxy(limits)
-
-	ctx := context.Background()
+	proxy, err := NewPDFProcessorWasmProxy(engine, limits)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
 
 	// Case 1: Read from whitelisted directory succeeds
 	content, err := proxy.ExtractTextFromFile(ctx, safeFilePath)
@@ -159,14 +193,23 @@ func TestPDFProcessorFilesystemGate(t *testing.T) {
 }
 
 func TestSandboxTimeoutEnforcement(t *testing.T) {
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
 	limits := gapi.NewBuilder().
 		Timeout(1 * time.Nanosecond). // Instant timeout preemption
 		Build()
 
-	proxy := NewPDFProcessorWasmProxy(limits)
+	proxy, err := NewPDFProcessorWasmProxy(engine, limits)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
 
-	ctx := context.Background()
-	_, err := proxy.ExtractTextFromFile(ctx, "any-path.txt")
+	_, err = proxy.ExtractTextFromFile(ctx, "any-path.txt")
 	if err == nil {
 		t.Fatalf("Expected timeout error, got nil")
 	}
@@ -176,7 +219,14 @@ func TestSandboxTimeoutEnforcement(t *testing.T) {
 }
 
 func TestWasmBranchCoverage(t *testing.T) {
-	err := os.MkdirAll("wasm", 0755)
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	err = os.MkdirAll("wasm", 0755)
 	if err != nil {
 		t.Fatalf("Failed to create Wasm directory: %v", err)
 	}
@@ -188,15 +238,11 @@ func TestWasmBranchCoverage(t *testing.T) {
 	}
 	defer os.RemoveAll("wasm")
 
-	gruntime.ClearCache()
-	defer gruntime.ClearCache() // Clear mock out after test completes
+	engine.ClearCache()
 
-	limits := gapi.NewBuilder().
-		Strict(true).
-		Build()
+	limits := gapi.NewBuilder().Build()
 
-	proxy := NewYAMLParserWasmProxy(limits)
-	_, err = proxy.Parse(context.Background(), []byte("name: test"))
+	_, err = NewYAMLParserWasmProxy(engine, limits)
 	if err == nil {
 		t.Fatalf("Expected error due to missing malloc/Parse exports, got nil")
 	}

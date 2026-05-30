@@ -5,30 +5,48 @@ import (
 	"time"
 )
 
+// LogLevel defines the severity of a sandbox log message.
+type LogLevel int
+
+const (
+	LevelInfo LogLevel = iota
+	LevelWarn
+	LevelError
+)
+
+func (l LogLevel) String() string {
+	switch l {
+	case LevelInfo:
+		return "INFO"
+	case LevelWarn:
+		return "WARN"
+	case LevelError:
+		return "ERROR"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // SandboxLogger represents a callback type for routing logging outputs.
-type SandboxLogger func(level string, msg string)
+type SandboxLogger func(level LogLevel, msg string)
 
 // SandboxLimits governs the boundary constraints of Wasm execution.
 type SandboxLimits struct {
-	maxInstructions         int64
-	maxMemoryPages          int32
-	strict                  bool
+	maxMemoryPages          *int32
+	permissive              bool
 	logger                  SandboxLogger
 	allowedDirectories      []string
 	allowedNetworkAddresses []string
 	timeout                 time.Duration
+	wasmPath                string
 }
 
-func (s *SandboxLimits) MaxInstructions() int64 {
-	return s.maxInstructions
-}
-
-func (s *SandboxLimits) MaxMemoryPages() int32 {
+func (s *SandboxLimits) MaxMemoryPages() *int32 {
 	return s.maxMemoryPages
 }
 
-func (s *SandboxLimits) IsStrict() bool {
-	return s.strict
+func (s *SandboxLimits) IsPermissive() bool {
+	return s.permissive
 }
 
 func (s *SandboxLimits) Logger() SandboxLogger {
@@ -47,6 +65,10 @@ func (s *SandboxLimits) Timeout() time.Duration {
 	return s.timeout
 }
 
+func (s *SandboxLimits) WasmPath() string {
+	return s.wasmPath
+}
+
 // SandboxLimitsBuilder is a fluent builder for SandboxLimits.
 type SandboxLimitsBuilder struct {
 	limits *SandboxLimits
@@ -55,10 +77,9 @@ type SandboxLimitsBuilder struct {
 func NewBuilder() *SandboxLimitsBuilder {
 	return &SandboxLimitsBuilder{
 		limits: &SandboxLimits{
-			maxInstructions:         -1,
-			maxMemoryPages:          -1,
-			strict:                  true,
-			logger:                  func(lvl, msg string) { log.Printf("[GUEST][%s] %s", lvl, msg) },
+			maxMemoryPages:          nil,
+			permissive:              false,
+			logger:                  func(lvl LogLevel, msg string) { log.Printf("[GUEST][%s] %s", lvl, msg) },
 			allowedDirectories:      make([]string, 0),
 			allowedNetworkAddresses: make([]string, 0),
 			timeout:                 0, // 0 means no timeout
@@ -66,18 +87,13 @@ func NewBuilder() *SandboxLimitsBuilder {
 	}
 }
 
-func (b *SandboxLimitsBuilder) MaxInstructions(max int64) *SandboxLimitsBuilder {
-	b.limits.maxInstructions = max
-	return b
-}
-
 func (b *SandboxLimitsBuilder) MaxMemoryPages(max int32) *SandboxLimitsBuilder {
-	b.limits.maxMemoryPages = max
+	b.limits.maxMemoryPages = &max
 	return b
 }
 
-func (b *SandboxLimitsBuilder) Strict(strict bool) *SandboxLimitsBuilder {
-	b.limits.strict = strict
+func (b *SandboxLimitsBuilder) PermissiveMode() *SandboxLimitsBuilder {
+	b.limits.permissive = true
 	return b
 }
 
@@ -86,22 +102,31 @@ func (b *SandboxLimitsBuilder) Logger(logger SandboxLogger) *SandboxLimitsBuilde
 	return b
 }
 
-func (b *SandboxLimitsBuilder) AllowFileSystemAccess(path string) *SandboxLimitsBuilder {
-	if path != "" {
-		b.limits.allowedDirectories = append(b.limits.allowedDirectories, path)
+func (b *SandboxLimitsBuilder) AllowFileSystemAccess(paths ...string) *SandboxLimitsBuilder {
+	for _, p := range paths {
+		if p != "" {
+			b.limits.allowedDirectories = append(b.limits.allowedDirectories, p)
+		}
 	}
 	return b
 }
 
-func (b *SandboxLimitsBuilder) AllowNetworkAddresses(addresses []string) *SandboxLimitsBuilder {
-	if addresses != nil {
-		b.limits.allowedNetworkAddresses = append(b.limits.allowedNetworkAddresses, addresses...)
+func (b *SandboxLimitsBuilder) AllowNetworkAddresses(addresses ...string) *SandboxLimitsBuilder {
+	for _, a := range addresses {
+		if a != "" {
+			b.limits.allowedNetworkAddresses = append(b.limits.allowedNetworkAddresses, a)
+		}
 	}
 	return b
 }
 
 func (b *SandboxLimitsBuilder) Timeout(d time.Duration) *SandboxLimitsBuilder {
 	b.limits.timeout = d
+	return b
+}
+
+func (b *SandboxLimitsBuilder) WasmPath(path string) *SandboxLimitsBuilder {
+	b.limits.wasmPath = path
 	return b
 }
 

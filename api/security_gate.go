@@ -49,7 +49,7 @@ func (s *SecurityGate) CheckFileAccess(ctx context.Context, path string) error {
 		return nil // No bounds set, allow execution
 	}
 
-	if limits.IsStrict() {
+	if !limits.IsPermissive() {
 		allowed := false
 		targetAbs, err := filepath.Abs(path)
 		if err != nil {
@@ -64,8 +64,14 @@ func (s *SecurityGate) CheckFileAccess(ctx context.Context, path string) error {
 			}
 			dirClean := filepath.Clean(dirAbs)
 
+			separator := string(filepath.Separator)
+			prefix := dirClean
+			if !strings.HasSuffix(prefix, separator) {
+				prefix += separator
+			}
+
 			// Match prefix to assert parent directory alignment securely
-			if targetClean == dirClean || strings.HasPrefix(targetClean, dirClean+string(filepath.Separator)) {
+			if targetClean == dirClean || strings.HasPrefix(targetClean, prefix) {
 				allowed = true
 				break
 			}
@@ -85,7 +91,7 @@ func (s *SecurityGate) CheckNetworkAccess(ctx context.Context, hostAndPort strin
 		return nil
 	}
 
-	if limits.IsStrict() {
+	if !limits.IsPermissive() {
 		allowed := false
 		targetNorm := strings.ToLower(strings.TrimSpace(hostAndPort))
 

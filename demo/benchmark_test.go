@@ -59,13 +59,21 @@ func BenchmarkNativeYAMLParse(b *testing.B) {
 
 // BenchmarkGlassboxedYAMLParse measures glassboxed/sandboxed yaml parsing performance (including context limits, timeouts, and boundaries validation)
 func BenchmarkGlassboxedYAMLParse(b *testing.B) {
-	gruntime.ClearCache()
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		b.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
 	limits := gapi.NewBuilder().
 		Timeout(10 * time.Millisecond).
 		Build()
-	proxy := NewYAMLParserWasmProxy(limits)
+	proxy, err := NewYAMLParserWasmProxy(engine, limits)
+	if err != nil {
+		b.Fatal(err)
+	}
 	yamlData := []byte("name: Glassbox-Go\nversion: 1.0.0\nsecure: true\n")
-	ctx := context.Background()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -93,13 +101,21 @@ func BenchmarkNativeMarkdownRender(b *testing.B) {
 
 // BenchmarkGlassboxedMarkdownRender measures glassboxed/sandboxed markdown rendering performance (including context limits, timeouts, and boundaries validation)
 func BenchmarkGlassboxedMarkdownRender(b *testing.B) {
-	gruntime.ClearCache()
+	ctx := context.Background()
+	engine, err := gruntime.NewEngine(ctx)
+	if err != nil {
+		b.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
 	limits := gapi.NewBuilder().
 		Timeout(10 * time.Millisecond).
 		Build()
-	proxy := NewMarkdownParserWasmProxy(limits)
+	proxy, err := NewMarkdownParserWasmProxy(engine, limits)
+	if err != nil {
+		b.Fatal(err)
+	}
 	markdown := []byte("# Heading\nHello world from benchmark.")
-	ctx := context.Background()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"os"
 	"unsafe"
 
@@ -112,7 +113,7 @@ func fetch(ctx context.Context, urlString string) (string, error) {
 	urlLen := uint32(len(urlBytes))
 
 	res := fetchHTTP(uint32(uintptr(unsafe.Pointer(urlPtr))), urlLen)
-	if res == 0 {
+	if res == 0xFFFFFFFFFFFFFFFF {
 		return "", errors.New("HTTP fetch failed")
 	}
 

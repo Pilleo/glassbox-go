@@ -59,7 +59,7 @@ type MockProcessor interface {
 		"func NewMockProcessorWasmProxy",
 		"func (p *MockProcessorWasmProxy) ProcessData",
 		"gapi.WithActiveLimits",
-		"gruntime.GetInstance",
+		"engine.GetInstance",
 	}
 
 	for _, expected := range expectedStrings {

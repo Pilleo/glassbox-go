@@ -1,71 +1,74 @@
 # Future Improvements: Glassbox-Go
 
-This document details the design and implementation blueprints for advanced capabilities planned for future phases of the **Glassbox-Go** transparent, JIT WebAssembly sandboxing framework.
+This document details the roadmap for advanced capabilities and architectural refinements planned for future phases of the **Glassbox-Go** framework.
 
 ---
 
-## 1. Instruction Fuel Limiter (Strict Gas Preemption)
+## 🚀 Future Roadmap
 
-### The Vision
-While cooperative context timeout halts runaway infinite loops, it still allows a malicious plugin to consume 100% CPU on a core for the duration of the timeout (e.g., 1 second). We want a **precise instruction quota (fuel/gas limit)** that preempts execution after executing exactly $N$ instructions, even if the timeout duration is not yet reached.
+### 1. Instruction-Level Fuel Limiter (Gas Instrumentation)
 
-### Implementation Blueprint
-Wazero compiles modules into in-memory machine instructions. We can hook a custom compilation compiler listener or register an experimental JIT block listener (`experimental.FunctionListener`) that increments a thread-safe counter.
+#### The Vision
+While cooperative context timeouts (currently implemented) halt runaway loops, a malicious plugin can still consume 100% CPU for the duration of that timeout. We want a **precise instruction quota** that preempts execution after exactly $N$ opcodes.
 
+#### The Challenge
+Wazero's JIT does not expose an instruction counter by default. To implement this without a 10x performance hit (like an interpreter would have), we need to:
+1.  **Instrument the Wasm Binary**: Pre-process the Wasm bytecode before JIT compilation to inject "decrement fuel" opcodes at the start of every basic block.
+2.  **Host-side Trap**: When the counter reaches zero, the guest calls a host function that triggers a panic or trap, safely halting the JIT execution.
+
+### 2. Multi-Module Sandbox Orchestration (Micro-Plugin Mesh)
+
+#### The Vision
+Enable multiple isolated plugins to communicate directly within the **same Wazero Namespace** without bouncing back to the Go host. This allows for complex pipelines (e.g., Auth -> Transform -> Log) with near-zero latency between steps.
+
+#### Implementation Blueprint
+1.  **Shared Namespace**: Proxies for different interfaces should optionally share a single `wazero.Namespace`.
+2.  **Export Linking**: Modify the runtime to resolve imports of Module B from the exports of Module A during instantiation.
+
+### 3. Zero-Copy Shared Memory (Large Data Optimization)
+
+#### The Vision
+Currently, data is copied into the Wasm linear memory via `mod.Memory().Write`. For multi-megabyte payloads (e.g., large PDF processing or video frame analysis), this copy is a bottleneck.
+
+#### Implementation Blueprint
+- Utilize **Wasm Shared Memory** and **Atomics** (once stable in Wazero).
+- Explore **Memory Mapping** techniques to allow the guest to read directly from a host-provided buffer via a restricted memory view.
+
+### 4. Generator Enhancements
+
+#### The Vision
+Expand the `gobox-gen` tool to handle more complex Go types and interface patterns.
+- **Embedded Interfaces**: Support interfaces that embed other interfaces.
+- **Type Aliases**: Correct handling of user-defined type aliases.
+- **Auto-Embedding**: Optional automatic generation of `//go:embed` directives to bundle Wasm binaries directly into the Go application binary.
+
+### 5. Disk-Based Compilation Cache (Cold Start Optimization)
+
+#### The Vision
+Currently, the JIT-compiled module lives only in process memory — every cold start (new process, restart, deploy) re-compiles the Wasm binary from scratch. For large plugins this can take hundreds of milliseconds. Wazero already exposes a file-system compilation cache that serializes native JIT artifacts to disk and reuses them across restarts.
+
+#### Implementation Blueprint
 ```go
-package runtime
-
-import (
-	"context"
-	"github.com/tetratelabs/wazero/api"
-	"github.com/tetratelabs/wazero/experimental"
-)
-
-type InstructionLimiter struct {
-	MaxInstructions int64
-	CurrentCount    int64
+cache, err := wazero.NewCompilationCacheWithDir("/var/cache/glassbox")
+if err != nil {
+    return err
 }
-
-// FunctionListener implementation
-func (l *InstructionLimiter) Before(ctx context.Context, mod api.Module, def api.FunctionDefinition, params []uint64, stack experimental.StackIterator) {
-	l.CurrentCount++
-	if l.CurrentCount > l.MaxInstructions {
-		// Panic automatically halts JIT compilation or execution and traps in wazero safely
-		panic(gapi.NewSandboxSecurityError("CPU gas limit exceeded"))
-	}
-}
-
-func (l *InstructionLimiter) After(ctx context.Context, mod api.Module, def api.FunctionDefinition, results []uint64) {}
+rConfig := wazero.NewRuntimeConfigCompiler().
+    WithCompilationCache(cache)
 ```
+The cache is keyed on the Wasm binary hash, so stale entries are never replayed after an update. Exposes as an optional `WithCompilationCache(dir string)` method on `SandboxLimitsBuilder` or the future `Runtime` type.
 
-To register this, we use wazero's JIT listener factory during compilation configuration, keeping the guest completely oblivious to the CPU gas tracking overhead.
+### 6. WASI Preview 2 / WebAssembly Component Model (Strategic North Star)
 
----
+#### The Vision
+The current ABI is hand-rolled: arguments are msgpack-serialized into a single byte buffer, passed as a packed `uint64` (pointer + length), and the return is read back the same way. This works but it is Go-specific, brittle to extend, and not interoperable with plugins written in Rust, C, or Swift.
 
-## 2. Multi-Module Sandbox Orchestration (Micro-Plugin Mesh)
+The **WebAssembly Component Model** (WASI Preview 2) is the standards-track answer: plugins and hosts agree on a typed `.wit` (Wasm Interface Type) file, and toolchains auto-generate the marshaling in any language. The interface boundary becomes language-agnostic.
 
-### The Vision
-Enterprise architectures frequently require executing multiple isolated pipelines sequentially (e.g., executing an Authentication check, evaluating Business Rules, and executing a Logger). Routing data `Wasm -> Go Host -> Wasm -> Go Host` incurs high boundary-crossing latency. We want to orchestrate multiple Wasm modules inside the **same Runtime Namespace** and link their exports together directly.
+#### What This Enables
+- Plugins written in **Rust, C, Swift, or Kotlin** callable from the same Go proxy
+- No hand-written ABI — the `.wit` file is the contract
+- Automatic msgpack/custom serialization replaced by canonical Component Model encoding
 
-### The Architecture
-
-```
-[Go Host Application]
-       │ (Single JIT Call)
-       ▼
-┌────────────────── Wazero Namespace ──────────────────┐
-│                                                      │
-│  [AuthModule] ──► [RuleModule] ──► [LoggerModule]    │
-│    (Wasm)           (Wasm)            (Wasm)         │
-│                                                      │
-└──────────────────────────────────────────────────────┘
-```
-
-### Implementation Blueprint
-We can link modules dynamically using wazero's Namespace APIs:
-1.  **Instantiate Dependencies**: Instantiate the utility modules first in the namespace:
-    ```go
-    loggerModule, _ := rt.InstantiateModule(ctx, compiledLogger, config.WithName("logger"))
-    ```
-2.  **Bind Linkage**: When instantiating the main orchestrator, wazero automatically resolves any imports matching `"logger"` inside the same namespace, binding the calls directly at compilation time.
-3.  **Perform Execution**: The Go host makes a single JIT invocation to the orchestrator, which executes the entire pipeline natively in WebAssembly JIT space at near-native speeds.
+#### Current State
+Wazero has experimental WASI Preview 2 support as of v1.7. Full Component Model (`wasmtime`-level) is not yet stable in wazero. This is a 1–2 year horizon item but the `//gobox:sandbox` annotation on an interface maps naturally onto a `.wit` interface definition — the migration path is clear.

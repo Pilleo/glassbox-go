@@ -10,10 +10,10 @@ import (
 )
 
 func TestSafeLogWriter(t *testing.T) {
-	var loggedLvl string
+	var loggedLvl gapi.LogLevel
 	var loggedMsg string
 
-	logger := func(lvl, msg string) {
+	logger := func(lvl gapi.LogLevel, msg string) {
 		loggedLvl = lvl
 		loggedMsg = msg
 	}
@@ -32,8 +32,8 @@ func TestSafeLogWriter(t *testing.T) {
 		t.Errorf("Expected n=%d, got: %d", len(p), n)
 	}
 
-	if loggedLvl != "INFO" {
-		t.Errorf("Expected level INFO, got: %s", loggedLvl)
+	if loggedLvl != gapi.LevelInfo {
+		t.Errorf("Expected level INFO, got: %v", loggedLvl)
 	}
 	if loggedMsg != "Hello wazero logger!" { // Ensure trailing newline was stripped
 		t.Errorf("Expected stripped message, got: %s", loggedMsg)
@@ -56,13 +56,18 @@ func TestWasmCompilationAndCaching(t *testing.T) {
 	}
 
 	limits := gapi.NewBuilder().
-		Strict(false).
+		PermissiveMode().
 		Build()
 
 	ctx := context.Background()
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
 
 	// 1. First compilation: loads from disk and JIT compiles
-	mod1, err := GetInstance(ctx, "EngineCacheTest", limits)
+	mod1, err := engine.GetInstance(ctx, "EngineCacheTest", limits)
 	if err != nil {
 		t.Fatalf("GetInstance first load failed: %v", err)
 	}
@@ -71,9 +76,9 @@ func TestWasmCompilationAndCaching(t *testing.T) {
 	}
 
 	// Verify it was successfully cached in our global cache
-	cacheMutex.RLock()
-	_, exists := moduleCache["EngineCacheTest"]
-	cacheMutex.RUnlock()
+	engine.cacheMutex.RLock()
+	_, exists := engine.moduleCache["EngineCacheTest"]
+	engine.cacheMutex.RUnlock()
 	if !exists {
 		t.Errorf("Expected module to be cached in moduleCache")
 	}
@@ -82,7 +87,7 @@ func TestWasmCompilationAndCaching(t *testing.T) {
 	mod1.Close(ctx)
 
 	// 2. Second compilation: should hit compilation cache
-	mod2, err := GetInstance(ctx, "EngineCacheTest", limits)
+	mod2, err := engine.GetInstance(ctx, "EngineCacheTest", limits)
 	if err != nil {
 		t.Fatalf("GetInstance cached load failed: %v", err)
 	}
@@ -94,13 +99,17 @@ func TestWasmCompilationAndCaching(t *testing.T) {
 
 func TestLoadWasmBytesErrors(t *testing.T) {
 	limits := gapi.NewBuilder().
-		Strict(true).
 		Build()
 
 	ctx := context.Background()
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
 
 	// Try to get an instance of a non-existent module, should fail cleanly with standard file stat errors
-	_, err := GetInstance(ctx, "NonExistentModule-ABC-123", limits)
+	_, err = engine.GetInstance(ctx, "NonExistentModule-ABC-123", limits)
 	if err == nil {
 		t.Fatalf("Expected error loading non-existent module, got nil")
 	}
@@ -129,7 +138,13 @@ func TestWasmWithMemoryLimitPages(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	mod, err := GetInstance(ctx, "MemoryLimitTest", limits)
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	mod, err := engine.GetInstance(ctx, "MemoryLimitTest", limits)
 	if err != nil {
 		t.Fatalf("GetInstance with memory limits failed: %v", err)
 	}
@@ -163,7 +178,13 @@ func TestWasmWithAllowedDirectories(t *testing.T) {
 		Build()
 
 	ctx := context.Background()
-	mod, err := GetInstance(ctx, "DirLimitTest", limits)
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	mod, err := engine.GetInstance(ctx, "DirLimitTest", limits)
 	if err != nil {
 		t.Fatalf("GetInstance with directory limits failed: %v", err)
 	}
@@ -186,8 +207,9 @@ func TestWasmWithLoggerRedirection(t *testing.T) {
 		t.Fatalf("Failed to write mock Wasm file: %v", err)
 	}
 
-	var loggedLvl, loggedMsg string
-	logger := func(lvl, msg string) {
+	var loggedLvl gapi.LogLevel
+	var loggedMsg string
+	logger := func(lvl gapi.LogLevel, msg string) {
 		loggedLvl = lvl
 		loggedMsg = msg
 	}
@@ -196,13 +218,19 @@ func TestWasmWithLoggerRedirection(t *testing.T) {
 		Logger(logger).
 		Build()
 
-	limits.Logger()("WARNING", "Simulated warning log")
-	if loggedLvl != "WARNING" || loggedMsg != "Simulated warning log" {
+	limits.Logger()(gapi.LevelWarn, "Simulated warning log")
+	if loggedLvl != gapi.LevelWarn || loggedMsg != "Simulated warning log" {
 		t.Errorf("Expected logger callback to function correctly")
 	}
 
 	ctx := context.Background()
-	mod, err := GetInstance(ctx, "LoggerLimitTest", limits)
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	mod, err := engine.GetInstance(ctx, "LoggerLimitTest", limits)
 	if err != nil {
 		t.Fatalf("GetInstance with custom logger failed: %v", err)
 	}
@@ -228,7 +256,13 @@ func TestWasmCompileError(t *testing.T) {
 
 	limits := gapi.NewBuilder().Build()
 	ctx := context.Background()
-	_, err = GetInstance(ctx, "InvalidWasmTest", limits)
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	_, err = engine.GetInstance(ctx, "InvalidWasmTest", limits)
 	if err == nil {
 		t.Fatalf("Expected compile error on invalid Wasm, got nil")
 	}
@@ -255,7 +289,13 @@ func TestWasmCompileErrorWithLimits(t *testing.T) {
 		MaxMemoryPages(2).
 		Build()
 	ctx := context.Background()
-	_, err = GetInstance(ctx, "InvalidWasmTestLimits", limits)
+	engine, err := NewEngine(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer engine.Close(ctx)
+
+	_, err = engine.GetInstance(ctx, "InvalidWasmTestLimits", limits)
 	if err == nil {
 		t.Fatalf("Expected compile error on invalid Wasm with memory limits, got nil")
 	}

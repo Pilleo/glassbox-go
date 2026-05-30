@@ -15,30 +15,25 @@ import (
 
 func TestSandboxLimitsBuilder(t *testing.T) {
 	called := false
-	logger := func(lvl, msg string) {
+	logger := func(lvl LogLevel, msg string) {
 		called = true
 	}
 
 	limits := NewBuilder().
-		MaxInstructions(500).
 		MaxMemoryPages(10).
-		Strict(false).
+		PermissiveMode().
 		Logger(logger).
 		AllowFileSystemAccess("/tmp").
 		AllowFileSystemAccess(""). // Should be ignored
-		AllowNetworkAddresses([]string{"localhost:8080"}).
-		AllowNetworkAddresses(nil). // Should be ignored
+		AllowNetworkAddresses("localhost:8080").
 		Timeout(5 * time.Second).
 		Build()
 
-	if limits.MaxInstructions() != 500 {
-		t.Errorf("Expected MaxInstructions 500, got %d", limits.MaxInstructions())
+	if limits.MaxMemoryPages() == nil || *limits.MaxMemoryPages() != 10 {
+		t.Errorf("Expected MaxMemoryPages 10, got %v", limits.MaxMemoryPages())
 	}
-	if limits.MaxMemoryPages() != 10 {
-		t.Errorf("Expected MaxMemoryPages 10, got %d", limits.MaxMemoryPages())
-	}
-	if limits.IsStrict() {
-		t.Errorf("Expected strict false")
+	if !limits.IsPermissive() {
+		t.Errorf("Expected permissive true")
 	}
 	if limits.Timeout() != 5*time.Second {
 		t.Errorf("Expected timeout 5s, got %v", limits.Timeout())
@@ -50,7 +45,7 @@ func TestSandboxLimitsBuilder(t *testing.T) {
 		t.Errorf("Expected allowed networks [localhost:8080], got %v", limits.AllowedNetworkAddresses())
 	}
 
-	limits.Logger()("INFO", "test log")
+	limits.Logger()(LevelInfo, "test log")
 	if !called {
 		t.Errorf("Expected logger callback to be invoked")
 	}
@@ -96,14 +91,14 @@ func TestSecurityGateFileSystem(t *testing.T) {
 		t.Errorf("Expected nil error for context without limits, got %v", err)
 	}
 
-	// Case 2: Non-strict limits -> allowed
-	limitsNonStrict := NewBuilder().Strict(false).Build()
-	ctxNonStrict := WithActiveLimits(ctx, limitsNonStrict)
-	if err := gate.CheckFileAccess(ctxNonStrict, "/etc/passwd"); err != nil {
-		t.Errorf("Expected nil error for non-strict limits, got %v", err)
+	// Case 2: Permissive mode -> allowed
+	limitsPermissive := NewBuilder().PermissiveMode().Build()
+	ctxPermissive := WithActiveLimits(ctx, limitsPermissive)
+	if err := gate.CheckFileAccess(ctxPermissive, "/etc/passwd"); err != nil {
+		t.Errorf("Expected nil error for permissive limits, got %v", err)
 	}
 
-	// Case 3: Strict limits with filesystem whitelisting
+	// Case 3: Strict mode (default) with filesystem whitelisting
 	tempDir, err := os.MkdirTemp("", "security-gate-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
@@ -117,7 +112,6 @@ func TestSecurityGateFileSystem(t *testing.T) {
 	}
 
 	limitsStrict := NewBuilder().
-		Strict(true).
 		AllowFileSystemAccess(allowedPath).
 		Build()
 	ctxStrict := WithActiveLimits(ctx, limitsStrict)
@@ -136,6 +130,15 @@ func TestSecurityGateFileSystem(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "Unauthorized filesystem access") {
 		t.Errorf("Expected filesystem access violation, got: %v", err)
 	}
+
+	// Sub-case 3c: Root directory whitelisting (test fix for Issue #2)
+	limitsRoot := NewBuilder().
+		AllowFileSystemAccess("/").
+		Build()
+	ctxRoot := WithActiveLimits(ctx, limitsRoot)
+	if err := gate.CheckFileAccess(ctxRoot, "/etc/passwd"); err != nil {
+		t.Errorf("Expected access allowed for root whitelisting, got: %v", err)
+	}
 }
 
 func TestSecurityGateNetwork(t *testing.T) {
@@ -147,17 +150,16 @@ func TestSecurityGateNetwork(t *testing.T) {
 		t.Errorf("Expected nil error for context without limits, got %v", err)
 	}
 
-	// Case 2: Non-strict limits -> allowed
-	limitsNonStrict := NewBuilder().Strict(false).Build()
-	ctxNonStrict := WithActiveLimits(ctx, limitsNonStrict)
-	if err := gate.CheckNetworkAccess(ctxNonStrict, "google.com:443"); err != nil {
-		t.Errorf("Expected nil error for non-strict limits, got %v", err)
+	// Case 2: Permissive mode -> allowed
+	limitsPermissive := NewBuilder().PermissiveMode().Build()
+	ctxPermissive := WithActiveLimits(ctx, limitsPermissive)
+	if err := gate.CheckNetworkAccess(ctxPermissive, "google.com:443"); err != nil {
+		t.Errorf("Expected nil error for permissive limits, got %v", err)
 	}
 
-	// Case 3: Strict limits with whitelisted egress
+	// Case 3: Strict mode with whitelisted egress
 	limitsStrict := NewBuilder().
-		Strict(true).
-		AllowNetworkAddresses([]string{"api.rates.com", "localhost:8080"}).
+		AllowNetworkAddresses("api.rates.com", "localhost:8080").
 		Build()
 	ctxStrict := WithActiveLimits(ctx, limitsStrict)
 
@@ -212,8 +214,7 @@ func TestVirtualHTTPClient(t *testing.T) {
 
 	// Case 2: Restricted whitelisted context -> should succeed
 	limits := NewBuilder().
-		Strict(true).
-		AllowNetworkAddresses([]string{u.Host}).
+		AllowNetworkAddresses(u.Host).
 		Build()
 	ctxRestricted := WithActiveLimits(ctx, limits)
 	resp, err = client.Fetch(ctxRestricted, server.URL)
@@ -226,8 +227,7 @@ func TestVirtualHTTPClient(t *testing.T) {
 
 	// Case 3: Restricted unauthorized context -> should fail-fast
 	limitsBlocked := NewBuilder().
-		Strict(true).
-		AllowNetworkAddresses([]string{"some-other-egress.com"}).
+		AllowNetworkAddresses("some-other-egress.com").
 		Build()
 	ctxBlocked := WithActiveLimits(ctx, limitsBlocked)
 	_, err = client.Fetch(ctxBlocked, server.URL)
@@ -246,8 +246,7 @@ func TestVirtualHTTPClient(t *testing.T) {
 
 	// Case 5: Default port checks (https vs http)
 	limitsDefaultPort := NewBuilder().
-		Strict(true).
-		AllowNetworkAddresses([]string{"api.rates.com:443"}).
+		AllowNetworkAddresses("api.rates.com:443").
 		Build()
 	ctxDefaultPort := WithActiveLimits(ctx, limitsDefaultPort)
 	// Triggers HTTPS branch (which defaults port to 443) -> CheckNetworkAccess whitelisted match,
@@ -262,8 +261,7 @@ func TestVirtualHTTPClient(t *testing.T) {
 
 	// Same for HTTP (defaults port to 80)
 	limitsHTTPPort := NewBuilder().
-		Strict(true).
-		AllowNetworkAddresses([]string{"api.rates.com:80"}).
+		AllowNetworkAddresses("api.rates.com:80").
 		Build()
 	ctxHTTPPort := WithActiveLimits(ctx, limitsHTTPPort)
 	_, err = client.Fetch(ctxHTTPPort, "http://api.rates.com/data")

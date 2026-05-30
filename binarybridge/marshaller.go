@@ -1,6 +1,7 @@
 package binarybridge
 
 import (
+	"fmt"
 	"unsafe"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -31,4 +32,20 @@ func ZeroCopyBytesToFloat32(data []byte) []float32 {
 		return nil
 	}
 	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), len(data)/4)
+}
+
+// UnmarshalError is a helper to consistently unpack error values from Wasm guest responses.
+func UnmarshalError(v interface{}) error {
+	if v == nil {
+		return nil
+	}
+	if errStr, ok := v.(string); ok && errStr != "" {
+		return fmt.Errorf("%s", errStr)
+	}
+	if errMap, ok := v.(map[string]interface{}); ok {
+		if msg, exists := errMap["Message"]; exists && msg != "" {
+			return fmt.Errorf("%v", msg)
+		}
+	}
+	return nil
 }
