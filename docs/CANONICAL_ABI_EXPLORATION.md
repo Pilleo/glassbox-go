@@ -62,3 +62,15 @@ Modifying the standard Go compiler (`cmd/compile` and `cmd/link`) to emit Compon
 2.  **Extending the linker:** The Go linker would need to understand and emit Custom Sections containing the Component Model type definitions (the WIT schema essentially embedded as binary metadata).
 3.  **Compiler intrinsics:** The compiler would need to automatically generate the `realloc` functions and lower complex Go types (slices, maps, interfaces) into the rigid Canonical ABI memory layouts during the compilation phase, rather than relying on a library like `binarybridge`.
 While this is the ultimate long-term goal of the WebAssembly ecosystem (and there is ongoing work in the Go project to support it), it is years away from being stable and standard. Until then, user-space code generation (what Glassbox-Go is doing) remains the most pragmatic solution.
+
+### Do other languages natively output Component Wasm?
+The short answer is **no mainstream language compiles directly to the Component Model natively without external code generators.**
+
+Here is the current state of the art (as of mid-2024):
+*   **Rust:** Rust is the most advanced in this space, but even `rustc` compiles to core WebAssembly (`wasm32-wasip1` or `wasm32-unknown-unknown`). To get a Component, developers must use `cargo-component` or `wit-bindgen`, which acts as a macro layer to generate the bindings, followed by `wasm-tools` to adapt the core Wasm into a Component.
+*   **TinyGo (Go subset):** TinyGo has much better support for the Component Model than standard Go. It works closely with `wit-bindgen-go`, but it still requires the two-step process of defining a `.wit` file and generating the binding glue code. It is not native to the `tinygo build` command.
+*   **C/C++:** Uses the `WASI SDK`, but like Rust, it produces core Wasm. You must use `wit-bindgen` for C to handle the Component Model types.
+*   **Kotlin (Kotlin/Wasm):** JetBrains is heavily investing in WebAssembly (specifically WasmGC). However, their focus is currently on the browser (DOM access) and core execution. Component Model support is on the roadmap but will likely rely on compiler plugins or external generators initially.
+*   **Python/JavaScript:** Interpreted languages run inside a pre-compiled Wasm engine (like a Wasm-compiled CPython interpreter). Tools like `componentize-py` and `jco` take the source code and essentially bundle it with a pre-built interpreter into a Component wrapper.
+
+In every ecosystem, the Component Model is currently handled via a **layer of tooling on top of the native compiler**. Glassbox-Go's approach (code-generating proxy files via AST inspection) perfectly aligns with how the rest of the industry is bridging this gap.
