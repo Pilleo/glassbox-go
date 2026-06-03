@@ -277,11 +277,12 @@ make clean
 The benchmark below measures the overhead of the **host-side proxy boundary only**. Actual guest execution inside wazero is typically 2–5× slower than native Go for compute-heavy workloads (wazero JIT-compiles the `.wasm` bytecode at first use and caches the result, but the Wasm execution model has intrinsic overhead).
 
 ```
-BenchmarkNativeYAMLParse-12       159,844     7,352 ns/op
-BenchmarkGlassboxedYAMLParse-12   153,406     7,798 ns/op
+BenchmarkNativeYAMLParse-4                 	   76692	     15438 ns/op
+BenchmarkGlassboxedYAMLParse_NonPooled-4   	      81	  17388484 ns/op
+BenchmarkGlassboxedYAMLParse_Pooled-4      	    1470	    814714 ns/op
 ```
 
-The 6% overhead comes from MessagePack serialization and memory allocation, not from wazero's JIT execution of Go code.
+The overhead comes from WebAssembly instantiation, MessagePack serialization, and memory allocation. However, utilizing a connection pool (Pooled) drastically improves performance.
 
 ---
 
