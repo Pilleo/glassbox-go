@@ -48,7 +48,7 @@ Using `wit-bindgen` natively would require a fundamental shift in Developer Expe
 1.  Developers would need to manually write intermediate `.wit` (WebAssembly Interface Type) schema files alongside their Go code.
 2.  The build process would require an external Rust-based dependency (`wit-bindgen` CLI) to generate bindings.
 
-To preserve the seamless Go-native experience, Glassbox-Go must either implement Canonical ABI packing in its own code generator (building the binary layouts internally) or eventually leverage standard Go compiler features if `wit-bindgen-go` logic is fully integrated into standard `go build` for WASIP1.
+However, this trade-off might be acceptable. Using `wit-bindgen` directly would eliminate the need to maintain a custom, complex memory packer inside Glassbox-Go. A potential middle ground is to use Glassbox-Go's AST parser to auto-generate the `.wit` file, and then call `wit-bindgen-go` internally during the build phase. This leverages community-standard tools while preserving the zero-config experience.
 
 ### Why not use `wit-bindgen-go` right now?
 While `wit-bindgen-go` exists, it still requires developers to write `.wit` files to define the interfaces and use external tooling. Glassbox-Go aims to auto-generate everything directly from the standard Go AST, hiding the complexity of Wasm and Component Models from the developer entirely. Wrapping `wit-bindgen-go` under the hood could be an option, but it would require dynamically generating `.wit` files from Go AST and shelling out to external Rust CLI tools during the build process, which complicates the tooling significantly.
