@@ -147,10 +147,20 @@ goos: linux
 goarch: amd64
 pkg: github.com/glassbox-go/demo
 
-BenchmarkComputeNative_10-4             144932        7828 ns/op
-BenchmarkComputeWasm_10_Pooled-4           ???         ??? ns/op
-BenchmarkComputeWasm_10_NonPooled-4        ???         ??? ns/op
-...
+BenchmarkStandardSerialization-4           	    2310	    518935 ns/op
+BenchmarkZeroCopySerialization-4           	611973456	         1.953 ns/op
+BenchmarkNativeYAMLParse-4                 	   76692	     15438 ns/op
+BenchmarkGlassboxedYAMLParse_NonPooled-4   	      81	  17388484 ns/op
+BenchmarkGlassboxedYAMLParse_Pooled-4      	    1470	    814714 ns/op
+BenchmarkComputeNative_10-4                	  141914	      8191 ns/op
+BenchmarkComputeWasm_10_NonPooled-4        	      79	  17522309 ns/op
+BenchmarkComputeWasm_10_Pooled-4           	    1722	    601927 ns/op
+BenchmarkComputeNative_1000-4              	    1449	    821611 ns/op
+BenchmarkComputeWasm_1000_NonPooled-4      	      22	  47202676 ns/op
+BenchmarkComputeWasm_1000_Pooled-4         	      34	  37454496 ns/op
+BenchmarkComputeNative_50000-4             	      26	  45794320 ns/op
+BenchmarkComputeWasm_50000_NonPooled-4     	       1	1852501865 ns/op
+BenchmarkComputeWasm_50000_Pooled-4        	       1	2245103848 ns/op
 
 Observation:
 For very small tasks (10 iterations), Wasm overhead (including instantiation and context setup) makes it significantly slower (ns vs ms scale). Using Pooled instances mitigates instantiation cost drastically.

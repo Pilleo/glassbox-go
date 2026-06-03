@@ -34,3 +34,18 @@ Given the complexity, a full transition should be done iteratively:
 
 ## 5. Alternative Path (wasi-preview2 / TinyGo)
 If `wasi-preview2` (Component Model) becomes standard in the mainline Go compiler (without relying heavily on TinyGo limits), the Canonical ABI binding will be handled natively by the compiler (`wit-bindgen-go`). Glassbox-Go could act purely as a DX orchestrator without needing to implement a custom Canonical ABI packer. This is monitored as Option C in `future_improvements.md`.
+
+## 6. Industry Context & Learnings
+Tools like **`wit-bindgen`** (Rust, C, Java, Go bindings), **`wasmtime`** (Rust host), and **`jco`** (JS wrapper) heavily utilize the Canonical ABI. They provide valuable blueprints for how Glassbox-Go can structure its own implementation:
+
+*   **Code Generation over Reflection:** `wit-bindgen` avoids runtime reflection entirely. Instead of generic serialization functions, it parses interface definitions (`.wit` files) to generate raw memory offset writes. Glassbox-Go's generator should adopt this pattern, calculating struct alignments during AST generation rather than at runtime.
+*   **Handling Maps:** The Canonical ABI intentionally lacks a map type due to cross-language memory layout differences. Maps are lowered to a list of key-value tuples. Glassbox-Go's generator should translate `map[K]V` into an intermediate `[]struct{ K; V }` prior to packing.
+*   **Variant Type Errors:** Errors are packed as `result<T, E>`, starting with a 1-byte discriminator tag (0=OK, 1=Error) followed by the padded payload. Glassbox-Go can adopt this layout for Go's standard `func() (T, error)` signatures.
+
+### Why not use `wit-bindgen` directly?
+Glassbox-Go's core value proposition is **zero-config, interface-driven sandboxing**. It operates directly on standard Go code (`type MyInterface interface { ... }`).
+Using `wit-bindgen` natively would require a fundamental shift in Developer Experience (DX):
+1.  Developers would need to manually write intermediate `.wit` (WebAssembly Interface Type) schema files alongside their Go code.
+2.  The build process would require an external Rust-based dependency (`wit-bindgen` CLI) to generate bindings.
+
+To preserve the seamless Go-native experience, Glassbox-Go must either implement Canonical ABI packing in its own code generator (building the binary layouts internally) or eventually leverage standard Go compiler features if `wit-bindgen-go` logic is fully integrated into standard `go build` for WASIP1.
