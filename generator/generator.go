@@ -243,6 +243,15 @@ func processPackage(pkg *ast.Package, absPath string, autoBuild bool) error {
 }
 
 var funcMap = template.FuncMap{
+	"guestRetType": func(typ string, pkg string) string {
+		if strings.HasPrefix(typ, "*") && !strings.HasPrefix(typ, "*"+pkg+".") {
+			return "*" + pkg + "." + typ[1:]
+		}
+		if !strings.HasPrefix(typ, "*") && !strings.Contains(typ, ".") && typ != "error" && typ != "string" && typ != "int" && typ != "int32" && typ != "int64" && typ != "float32" && typ != "float64" && typ != "bool" && typ != "[]byte" && typ != "[]string" && typ != "map[string]interface{}" && !strings.HasPrefix(typ, "map[") && !strings.HasPrefix(typ, "[]") {
+            return pkg + "." + typ
+        }
+		return typ
+	},
 	"lower": strings.ToLower,
 	"joinParams": func(params []paramSpec) string {
 		var s []string
@@ -597,7 +606,7 @@ func {{.Name}}(ptr *byte, size uint32) uint64 {
 	errDeserialize := binarybridge.DeserializeFromBytes(payload, &args)
 
 {{range $i, $r := .Results}}{{if eq $r.Type "error"}}	var err error
-{{else}}	var ret{{$i}} {{$r.Type}}
+{{else}}	var ret{{$i}} {{guestRetType $r.Type $.PackageName}}
 {{end}}{{end}}	var errOut string
 
 	if errDeserialize != nil {
