@@ -154,3 +154,95 @@ Target Area: `runtime/engine.go`
 Finding Description: The Wasm modules are loaded from disk via `loadWasmBytes` and compiled into the `moduleCache` or `limitedCache`. There is an `e.ClearCache()` function, but no targeted invalidation (e.g., `e.ReloadModule("demo")`). If a Wasm binary is updated on disk while the host is running, the engine continues to use the stale JIT-compiled version indefinitely.
 Developer Impact / Risk: Hot-reloading of plugins during development requires a full server restart, which degrades the developer experience.
 Recommendation: Implement an `e.InvalidateModule(moduleName string)` method that removes specific modules from the caches, allowing seamless live-reloading of sandboxed code.
+🔴 [Severity: MEDIUM]: Unclear Error Mapping for Unknown `SandboxPath` Resolution
+Dimension: Safety / Configuration
+Target Area: `api/security_gate.go:resolvePath`
+Finding Description: In `resolvePath(path string)`, the code handles absolute path conversion. However, it does not distinguish properly between a file that simply does not exist vs one that violates bounds via an invalid path structure, masking the true problem for standard error mapping.
+Developer Impact / Risk: The error `fmt.Errorf("Security Sandbox Violation: Invalid path resolution for %s", path)` might be emitted for a benign "File Not Found" if the underlying host resolution behavior is overly aggressive during symlink evaluation.
+Recommendation: Update `resolvePath` and `CheckFileAccess` to distinguish between "Target does not exist" and "Target resolution violates sandbox path bounds".
+
+🔴 [Severity: LOW]: Missing Explicit Timeout in Fetch Requests
+Dimension: DX / Safety
+Target Area: `api/http_client.go:VirtualHTTPClient.Fetch`
+Finding Description: Although the VirtualHTTPClient respects `context.Context` cancellation during the actual `http.NewRequestWithContext` execution and subsequent body reading, it does not explicitly cap or impose its own hard timeout on the individual `Fetch` method invocation if a user provides an infinite context (`context.Background()`).
+Developer Impact / Risk: A guest application that supplies an untracked background context might hang indefinitely on network I/O if the remote endpoint drops packets and the user's `SandboxLimits` timeout does not apply cleanly to the HTTP sub-call.
+Recommendation: Plumb the `SandboxLimits` timeout (or a specific network egress timeout) explicitly into the context used for `Fetch` rather than relying solely on the parent Wasm execution boundary timeout.
+
+🔴 [Severity: LOW]: Lack of Context Timeout Propagation to WaitGroups
+Dimension: DX / Architecture
+Target Area: `runtime/engine.go:Engine.GetInstance`
+Finding Description: Inside `GetInstance`, the singleflight group (`compileGrp.Do`) executes Wasm instantiation. This blocks all overlapping requests. However, `singleflight.Group.Do` does not take a context. If multiple requests are waiting on the compilation of a massive Wasm module and their contexts timeout, they cannot abort waiting. They must block until the single compilation finishes or fails.
+Developer Impact / Risk: A cancelled HTTP request on the host might leave a goroutine permanently blocked waiting for `singleflight` to finish compiling a Wasm module, consuming resources needlessly.
+Recommendation: Upgrade to `singleflight.Group.DoChan` and use a `select` statement with `ctx.Done()` to allow immediate return upon context cancellation.
+
+
+🔴 [Severity: MEDIUM]: Global `isLittleEndian` Resolution Assumption
+Dimension: Futureproofness
+Target Area: `binarybridge/marshaller.go:init`
+Finding Description: The system sets a global `isLittleEndian` variable inside the `init()` function of `marshaller.go`. While this works for standard Go host/guest executions, if this library is cross-compiled to unusual targets or used in environments where byte-order constraints are dynamic (like unusual WebAssembly runtimes or mixed architectures), a global static `init` flag could be a subtle liability.
+Developer Impact / Risk: Zero-copy operations like `ZeroCopyFloat32ToBytes` might produce corrupted floats in environments where standard Wasm32-WASI endian assumptions are challenged.
+Recommendation: Hardcode LittleEndian for Wasm, as Wasm is strictly little-endian by specification, instead of dynamically determining the host's endianness for Wasm serialization boundaries.
+
+🔴 [Severity: DX-FRICTION]: No Support for Passing Channels or Functions
+Dimension: DX / Tooling
+Target Area: `generator/generator.go:typeExprToString`
+Finding Description: The code generator explicitly rejects `chan` and `func` types in interface signatures with an error. While passing channels across the Wasm boundary is inherently complex, there is no helpful error message instructing the user *how* to refactor their code (e.g., using callbacks or polling instead).
+Developer Impact / Risk: A developer might try to use a channel for streaming responses and hit a blunt "Channel types are not supported" error, with no guidance on the Wasm limitation.
+Recommendation: Update the generator error messages to briefly explain that Wasm is a pass-by-value, request/response barrier and provide a link to the documentation on how to handle streaming or callbacks.
+
+
+🔴 [Severity: LOW]: Incomplete Validation of Allowed Directories
+Dimension: Safety / Configuration
+Target Area: `api/limits.go:AllowFileSystemAccess`
+Finding Description: `AllowFileSystemAccess` trims empty strings but it does not check if the provided path actually exists or is accessible during the configuration build step.
+Developer Impact / Risk: The SandboxLimits can be built with invalid paths, delaying the detection of configuration errors until the guest application actually tries to perform a filesystem operation, resulting in unexpected runtime failures rather than deployment-time failures.
+Recommendation: Add a validation step in `Build()` to verify that directories passed to `AllowFileSystemAccess` exist and are accessible, returning an error or logging a warning if they are not.
+
+🔴 [Severity: DX-FRICTION]: Missing Examples for Custom `WasmPath` Loading
+Dimension: Documentation
+Target Area: `README.md`
+Finding Description: The system allows customizing the Wasm binary location using `limits.WasmPath("./custom_dir")`, but the `README.md` does not explain when or why to use this, nor does it provide a complete example of how to deploy and load compiled binaries from custom paths in production.
+Developer Impact / Risk: Developers might struggle to understand how to bundle and load their compiled `.wasm` files in a real-world deployment (e.g., Docker container), falling back on the default path assumptions which might not work outside of the development environment.
+Recommendation: Add a short section in `README.md` demonstrating a production deployment structure, showing how to load a `.wasm` file using `WasmPath()` from a specific embedded or runtime directory.
+
+🔴 [Severity: LOW]: Missing Explicit Log Level Filtering
+Dimension: DX / Configuration
+Target Area: `api/limits.go`
+Finding Description: The `SandboxLimitsBuilder` allows providing a custom `SandboxLogger`, but there is no mechanism to set a minimum log level (e.g., only log `WARN` and `ERROR`, ignore `INFO`).
+Developer Impact / Risk: Developers might be flooded with `INFO` logs from guest modules if they cannot easily filter them out at the sandbox boundary, forcing them to implement filtering logic inside their custom logger callback.
+Recommendation: Add a `MinLogLevel(level LogLevel)` option to `SandboxLimitsBuilder` and filter logs inside `safeLogWriter.Write` based on this configured minimum level.
+
+🔴 [Severity: LOW]: Missing Test Coverage for Zero-Copy Methods
+Dimension: Maintainability / Code Health
+Target Area: `binarybridge/marshaller_test.go` (missing)
+Finding Description: There are no unit tests for `ZeroCopyFloat32ToBytes` and `ZeroCopyBytesToFloat32` in the `binarybridge` package to verify their correctness across different endianness or alignment scenarios.
+Developer Impact / Risk: The lack of tests increases the risk of regressions or subtle memory corruption bugs if these low-level unsafe pointer conversions are modified or if the codebase is compiled under different target architectures.
+Recommendation: Add comprehensive unit tests for `binarybridge/marshaller.go`, especially covering the zero-copy array conversion functions and the `isLittleEndian` dynamic resolution logic.
+
+🔴 [Severity: LOW]: Missing Explicit Warning on Pass-by-Value Limitations for Slices
+Dimension: Documentation / DX
+Target Area: `README.md`
+Finding Description: While the documentation notes that pointers and slices are passed by value and modifications are not reflected on the host, it doesn't clearly explain *why* (due to memory isolation and MessagePack serialization).
+Developer Impact / Risk: Developers used to standard Go semantics might still try to pass a slice and modify it in-place within the guest, expecting the host to see the changes. This can lead to confusing bugs where data appears to be silently dropped.
+Recommendation: Emphasize the pass-by-value limitation in the `README.md` with a concrete "Anti-Pattern" example showing a slice modification failing, and the correct pattern (returning the modified slice) alongside it.
+
+🔴 [Severity: LOW]: Hardcoded `wazero` Wasi Registration
+Dimension: Maintainability / Futureproofness
+Target Area: `runtime/engine.go:NewEngine`
+Finding Description: `wasi_snapshot_preview1.MustInstantiate(ctx, rt)` is called unconditionally during `NewEngine` initialization.
+Developer Impact / Risk: If the system ever needs to support pure computational plugins without WASI overhead (or plugins built for different WASI targets), the engine initialization is currently hardcoded to force WASI Preview 1 registration.
+Recommendation: Make WASI initialization configurable (e.g., via a flag in the engine configuration or `SandboxLimits`), allowing the instantiation of purely computational, completely hermetic sandboxes that don't even have WASI host functions linked.
+
+🔴 [Severity: LOW]: Missing Explicit Support for Nested Structs in Code Generator
+Dimension: Tooling / DX
+Target Area: `generator/generator.go:typeExprToString`
+Finding Description: The code generator's `typeExprToString` does not explicitly handle or parse deeply nested inline structs or complex composite types that might be valid Go but are problematic for MessagePack serialization across the Wasm boundary.
+Developer Impact / Risk: Users attempting to use highly complex nested structures might encounter cryptic MessagePack serialization errors at runtime, rather than clear compilation-time warnings from the generator.
+Recommendation: Add deeper type inspection in the generator to warn users if their interface signatures rely on types that are known to serialize poorly (e.g., inline structs or unexported fields in structs).
+
+🔴 [Severity: DX-FRICTION]: Silent Failure on Host Proxy Generation when Interfaces are Missing `error` Return
+Dimension: DX / Tooling
+Target Area: `generator/generator.go:parseInterfaceMethods`
+Finding Description: The system requires that every sandboxed interface method returns an `error` as its last return value. However, the generator might not robustly validate this during AST traversal.
+Developer Impact / Risk: If a user forgets to return an `error`, the generated Wasm guest code might fail to compile or silently break during deserialization of results, producing confusing runtime errors instead of a clean, early validation error from `gobox-gen`.
+Recommendation: Add explicit validation in the `parseInterfaceMethods` function to verify that the last return type of every method is `error`, and gracefully fail code generation with a clear, actionable error message if it's not.
