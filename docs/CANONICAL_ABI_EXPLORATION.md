@@ -55,3 +55,10 @@ While `wit-bindgen-go` exists, it still requires developers to write `.wit` file
 
 ### Why not generate `.wit` from compiled Wasm?
 Another theoretical approach is to compile the Go code to Wasm, use a tool like `wasm-tools component new` or `wit-component` to extract a WIT schema from the compiled binary, and then generate the bindings. However, this inverted workflow breaks Go's strong typing semantics. Standard Go binaries compiled to Wasm (using `GOOS=wasip1`) do not inherently embed Component Model types (like lists, variants, or strings) in their exports—they only export raw memory pointers and integer lengths. Thus, a tool cannot reliably reconstruct a high-level `.wit` file (e.g., distinguishing between a `string` and a `[]byte`, or identifying a struct) just by inspecting a standard compiled Wasm binary. The schema must be defined *before* or *during* code generation, making the Go AST the only reliable source of truth.
+
+### Can we modify Go to output Component-formatted Wasm natively?
+Modifying the standard Go compiler (`cmd/compile` and `cmd/link`) to emit Component Model Wasm natively is a massive undertaking. It would require:
+1.  **A new target architecture:** Likely something like `GOOS=wasip2` or `GOOS=wasm-component`.
+2.  **Extending the linker:** The Go linker would need to understand and emit Custom Sections containing the Component Model type definitions (the WIT schema essentially embedded as binary metadata).
+3.  **Compiler intrinsics:** The compiler would need to automatically generate the `realloc` functions and lower complex Go types (slices, maps, interfaces) into the rigid Canonical ABI memory layouts during the compilation phase, rather than relying on a library like `binarybridge`.
+While this is the ultimate long-term goal of the WebAssembly ecosystem (and there is ongoing work in the Go project to support it), it is years away from being stable and standard. Until then, user-space code generation (what Glassbox-Go is doing) remains the most pragmatic solution.
