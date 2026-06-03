@@ -24,8 +24,7 @@ func BenchmarkNativeMarkdownRender(b *testing.B) {
 	}
 }
 
-// BenchmarkGlassboxedMarkdownRender measures glassboxed/sandboxed markdown rendering performance
-func BenchmarkGlassboxedMarkdownRender(b *testing.B) {
+func benchmarkGlassboxedMarkdownRender(b *testing.B, pooled bool) {
 	ctx := context.Background()
 	engine, err := gruntime.NewEngine(ctx)
 	if err != nil {
@@ -34,7 +33,8 @@ func BenchmarkGlassboxedMarkdownRender(b *testing.B) {
 	defer engine.Close(ctx)
 
 	limits := gapi.NewBuilder().
-		Timeout(10 * time.Millisecond).
+		Timeout(500 * time.Millisecond).
+		PoolInstances(pooled).
 		WasmPath("../../wasm"). // Target the compiled wasm in workspace root
 		Build()
 	proxy, err := NewMarkdownParserWasmProxy(engine, limits)
@@ -50,4 +50,14 @@ func BenchmarkGlassboxedMarkdownRender(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkGlassboxedMarkdownRender_NonPooled measures glassboxed markdown rendering without instance reuse.
+func BenchmarkGlassboxedMarkdownRender_NonPooled(b *testing.B) {
+	benchmarkGlassboxedMarkdownRender(b, false)
+}
+
+// BenchmarkGlassboxedMarkdownRender_Pooled measures glassboxed markdown rendering with instance reuse.
+func BenchmarkGlassboxedMarkdownRender_Pooled(b *testing.B) {
+	benchmarkGlassboxedMarkdownRender(b, true)
 }

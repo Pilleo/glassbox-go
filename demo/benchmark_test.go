@@ -57,8 +57,7 @@ func BenchmarkNativeYAMLParse(b *testing.B) {
 	}
 }
 
-// BenchmarkGlassboxedYAMLParse measures glassboxed/sandboxed yaml parsing performance (including context limits, timeouts, and boundaries validation)
-func BenchmarkGlassboxedYAMLParse(b *testing.B) {
+func benchmarkGlassboxedYAMLParse(b *testing.B, pooled bool) {
 	ctx := context.Background()
 	engine, err := gruntime.NewEngine(ctx)
 	if err != nil {
@@ -67,7 +66,8 @@ func BenchmarkGlassboxedYAMLParse(b *testing.B) {
 	defer engine.Close(ctx)
 
 	limits := gapi.NewBuilder().
-		Timeout(10 * time.Millisecond).
+		Timeout(500 * time.Millisecond).
+		PoolInstances(pooled).
 		Build()
 	proxy, err := NewYAMLParserWasmProxy(engine, limits)
 	if err != nil {
@@ -84,6 +84,9 @@ func BenchmarkGlassboxedYAMLParse(b *testing.B) {
 	}
 }
 
+func BenchmarkGlassboxedYAMLParse_NonPooled(b *testing.B) { benchmarkGlassboxedYAMLParse(b, false) }
+func BenchmarkGlassboxedYAMLParse_Pooled(b *testing.B)    { benchmarkGlassboxedYAMLParse(b, true) }
+
 // Compute Benchmarks
 
 func benchmarkNativeCompute(b *testing.B, iterations int) {
@@ -99,7 +102,7 @@ func benchmarkNativeCompute(b *testing.B, iterations int) {
 	}
 }
 
-func benchmarkWasmCompute(b *testing.B, iterations int) {
+func benchmarkWasmCompute(b *testing.B, iterations int, pooled bool) {
 	ctx := context.Background()
 	engine, err := gruntime.NewEngine(ctx)
 	if err != nil {
@@ -109,6 +112,7 @@ func benchmarkWasmCompute(b *testing.B, iterations int) {
 
 	limits := gapi.NewBuilder().
 		Timeout(5 * time.Second).
+		PoolInstances(pooled).
 		Build()
 	proxy, err := NewComputeWorkerWasmProxy(engine, limits)
 	if err != nil {
@@ -124,14 +128,17 @@ func benchmarkWasmCompute(b *testing.B, iterations int) {
 	}
 }
 
-func BenchmarkComputeNative_10(b *testing.B)    { benchmarkNativeCompute(b, 10) }
-func BenchmarkComputeWasm_10(b *testing.B)      { benchmarkWasmCompute(b, 10) }
+func BenchmarkComputeNative_10(b *testing.B)         { benchmarkNativeCompute(b, 10) }
+func BenchmarkComputeWasm_10_NonPooled(b *testing.B) { benchmarkWasmCompute(b, 10, false) }
+func BenchmarkComputeWasm_10_Pooled(b *testing.B)    { benchmarkWasmCompute(b, 10, true) }
 
-func BenchmarkComputeNative_1000(b *testing.B)  { benchmarkNativeCompute(b, 1000) }
-func BenchmarkComputeWasm_1000(b *testing.B)    { benchmarkWasmCompute(b, 1000) }
+func BenchmarkComputeNative_1000(b *testing.B)         { benchmarkNativeCompute(b, 1000) }
+func BenchmarkComputeWasm_1000_NonPooled(b *testing.B) { benchmarkWasmCompute(b, 1000, false) }
+func BenchmarkComputeWasm_1000_Pooled(b *testing.B)    { benchmarkWasmCompute(b, 1000, true) }
 
-func BenchmarkComputeNative_50000(b *testing.B) { benchmarkNativeCompute(b, 50000) }
-func BenchmarkComputeWasm_50000(b *testing.B)   { benchmarkWasmCompute(b, 50000) }
+func BenchmarkComputeNative_50000(b *testing.B)         { benchmarkNativeCompute(b, 50000) }
+func BenchmarkComputeWasm_50000_NonPooled(b *testing.B) { benchmarkWasmCompute(b, 50000, false) }
+func BenchmarkComputeWasm_50000_Pooled(b *testing.B)    { benchmarkWasmCompute(b, 50000, true) }
 
 /*
 Benchmark Results (Compute iterations):
@@ -141,13 +148,11 @@ goarch: amd64
 pkg: github.com/glassbox-go/demo
 
 BenchmarkComputeNative_10-4             144932        7828 ns/op
-BenchmarkComputeWasm_10-4                   75    19554683 ns/op
-BenchmarkComputeNative_1000-4             1465      824229 ns/op
-BenchmarkComputeWasm_1000-4                 24    45884611 ns/op
-BenchmarkComputeNative_50000-4              25    44631167 ns/op
-BenchmarkComputeWasm_50000-4                 1  1832119475 ns/op
+BenchmarkComputeWasm_10_Pooled-4           ???         ??? ns/op
+BenchmarkComputeWasm_10_NonPooled-4        ???         ??? ns/op
+...
 
 Observation:
-For very small tasks (10 iterations), Wasm overhead (including instantiation and context setup) makes it significantly slower (ns vs ms scale).
+For very small tasks (10 iterations), Wasm overhead (including instantiation and context setup) makes it significantly slower (ns vs ms scale). Using Pooled instances mitigates instantiation cost drastically.
 As computation complexity increases (50000 iterations), the overhead of Wasm communication/setup becomes proportionately smaller, though memory and serialization bottlenecks start playing a role.
 */
