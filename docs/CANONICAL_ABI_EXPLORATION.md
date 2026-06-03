@@ -48,7 +48,28 @@ Using `wit-bindgen` natively would require a fundamental shift in Developer Expe
 1.  Developers would need to manually write intermediate `.wit` (WebAssembly Interface Type) schema files alongside their Go code.
 2.  The build process would require an external Rust-based dependency (`wit-bindgen` CLI) to generate bindings.
 
-However, this trade-off might be acceptable. Using `wit-bindgen` directly would eliminate the need to maintain a custom, complex memory packer inside Glassbox-Go. A potential middle ground is to use Glassbox-Go's AST parser to auto-generate the `.wit` file, and then call `wit-bindgen-go` internally during the build phase. This leverages community-standard tools while preserving the zero-config experience.
+### The Nuance: Can we use `wit-bindgen-go` effectively right now?
+The initial assumption was that using `wit-bindgen` would force developers to write `.wit` files manually, ruining the "zero-config" developer experience (DX). Furthermore, we assumed that generating standard `wasi-preview1` Wasm from mainline Go (rather than TinyGo) would not interoperate smoothly with `wit-bindgen-go`'s component lifting.
+
+However, after deeper consideration, a hybrid approach *is* technically possible, though it introduces significant architectural trade-offs:
+
+**The Hybrid Approach:**
+1.  **AST to WIT:** Glassbox-Go's `generator.go` parses the standard Go interface (e.g., `ComputeWorker`).
+2.  **Schema Generation:** Instead of generating Go proxy code directly, it auto-generates a temporary `.wit` file representing that interface.
+3.  **Binding Generation:** Glassbox-Go shells out to `wit-bindgen-go` under the hood, passing it the auto-generated `.wit` file to produce the memory-packing Go code.
+4.  **Compilation:** The standard `go build` process compiles the guest module (including the generated bindings).
+
+**The Pros of this Approach:**
+*   **No custom packer:** We don't have to write and maintain complex, highly-specific memory offset logic (`cabibridge`) to implement the Canonical ABI. We offload that to the Bytecode Alliance.
+*   **Standards compliant:** It ensures we are using the exact standard implementation of the Component Model.
+
+**The Cons (Why it's still problematic):**
+1.  **Toolchain bloat:** The `gobox-gen` command would now implicitly depend on an external Rust binary (`wit-bindgen`) being installed on the developer's machine, breaking the pure-Go toolchain promise.
+2.  **Type mismatches:** `wit-bindgen-go` is highly optimized for TinyGo right now. Standard Go `GOOS=wasip1` handles memory differently than TinyGo. Hooking `wit-bindgen-go` generated code into standard Go might require manual memory patching (e.g., handling the `cabi_realloc` export correctly across boundaries).
+3.  **Loss of Control:** If a user uses a specific Go type (like a map of interfaces), we are at the mercy of how `wit-bindgen-go` decides to handle it, rather than controlling the specific Wasm-to-Host serialization fallback.
+
+**Conclusion:**
+While theoretically possible to hide `wit-bindgen-go` behind Glassbox-Go's generator, it shifts the complexity from "writing a memory packer" to "orchestrating an external, rapidly-changing toolchain that is currently optimized for TinyGo, not standard Go." For a framework that prides itself on simplicity and standard Go support, implementing a tailored `cabibridge` internally remains the more robust, self-contained path until standard Go fully absorbs Component Model generation natively.
 
 ### Why not use `wit-bindgen-go` right now?
 While `wit-bindgen-go` exists, it still requires developers to write `.wit` files to define the interfaces and use external tooling. Glassbox-Go aims to auto-generate everything directly from the standard Go AST, hiding the complexity of Wasm and Component Models from the developer entirely. Wrapping `wit-bindgen-go` under the hood could be an option, but it would require dynamically generating `.wit` files from Go AST and shelling out to external Rust CLI tools during the build process, which complicates the tooling significantly.
