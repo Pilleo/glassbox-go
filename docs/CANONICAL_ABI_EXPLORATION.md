@@ -65,7 +65,9 @@ However, after deeper consideration, a hybrid approach *is* technically possible
 
 **The Cons (Why it's still problematic):**
 1.  **Toolchain bloat:** The `gobox-gen` command would now implicitly depend on an external Rust binary (`wit-bindgen`) being installed on the developer's machine, breaking the pure-Go toolchain promise.
-2.  **Type mismatches:** `wit-bindgen-go` is highly optimized for TinyGo right now. Standard Go `GOOS=wasip1` handles memory differently than TinyGo. Hooking `wit-bindgen-go` generated code into standard Go might require manual memory patching (e.g., handling the `cabi_realloc` export correctly across boundaries).
+2.  **Type mismatches and the TinyGo Bias:** `wit-bindgen-go` has historically been optimized for TinyGo rather than standard Go.
+    *   **Why optimize for TinyGo?** TinyGo was originally designed for microcontrollers, meaning it produces extremely small binaries and gives developers lower-level control over memory allocation (it doesn't use the massive runtime and garbage collector that standard Go uses). This made it perfect for early WebAssembly experiments where binary size and memory control were critical.
+    *   **Should Glassbox-Go switch to TinyGo?** Probably not. While TinyGo creates smaller Wasm files, it does not support the full standard Go library (e.g., many `net/http` and `crypto` packages fail to compile, and reflection is limited). Since Glassbox-Go aims to sandbox *any* existing standard Go code with zero friction, forcing users to ensure their code is "TinyGo compliant" defeats the core value proposition. Standard Go `GOOS=wasip1` handles memory and garbage collection differently than TinyGo, meaning hooking `wit-bindgen-go` generated code into standard Go requires manual memory patching (e.g., handling the `cabi_realloc` export correctly across boundaries without fighting the standard Go garbage collector).
 3.  **Loss of Control:** If a user uses a specific Go type (like a map of interfaces), we are at the mercy of how `wit-bindgen-go` decides to handle it, rather than controlling the specific Wasm-to-Host serialization fallback.
 
 **Conclusion:**
@@ -87,7 +89,7 @@ While this is the ultimate long-term goal of the WebAssembly ecosystem (and ther
 ### Do other languages natively output Component Wasm?
 The short answer is **no mainstream language compiles directly to the Component Model natively without external code generators.**
 
-Here is the current state of the art (as of mid-2024):
+Here is the current state of the art (as of mid-2026):
 *   **Rust:** Rust is the most advanced in this space, but even `rustc` compiles to core WebAssembly (`wasm32-wasip1` or `wasm32-unknown-unknown`). To get a Component, developers must use `cargo-component` or `wit-bindgen`, which acts as a macro layer to generate the bindings, followed by `wasm-tools` to adapt the core Wasm into a Component.
 *   **TinyGo (Go subset):** TinyGo has much better support for the Component Model than standard Go. It works closely with `wit-bindgen-go`, but it still requires the two-step process of defining a `.wit` file and generating the binding glue code. It is not native to the `tinygo build` command.
 *   **C/C++:** Uses the `WASI SDK`, but like Rust, it produces core Wasm. You must use `wit-bindgen` for C to handle the Component Model types.
